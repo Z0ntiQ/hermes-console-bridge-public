@@ -143,6 +143,34 @@ public class WinCon {
     RECT r; GetWindowRect(h, out r);
     return "POS " + r.Left + "x" + r.Top + " (" + (r.Right - r.Left) + "x" + (r.Bottom - r.Top) + "px)";
   }
+  // ---- one-console invariant: close console windows left behind by DEAD bridge generations ----
+  // A console window survives as long as ANY process is attached to it. When a bridge was
+  // killed, its child cmd.exe stayed attached as an orphan, so the window (title contains
+  // HERMES-CONSOLE) lingered — the user saw two+ blue consoles at once. The self-job prevents
+  // NEW ones; this sweep cleans EXISTING ones at every startup. WM_CLOSE is the graceful X-click
+  // path: conhost exits and takes the attached orphan with it. Our own HWND is skipped by
+  // identity — WM_CLOSE would bypass the SC_CLOSE lock, so exact-handle comparison is mandatory.
+  public delegate bool EnumWinCB(IntPtr h, IntPtr l);
+  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWinCB cb, IntPtr l);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowTextW(IntPtr h, System.Text.StringBuilder s, int n);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassNameW(IntPtr h, System.Text.StringBuilder s, int n);
+  [DllImport("user32.dll")] public static extern bool PostMessageW(IntPtr h, uint msg, IntPtr w, IntPtr l);
+  public static int CloseForeignHermesConsoles() {
+    IntPtr mine = GetConsoleWindow();
+    int closed = 0;
+    EnumWinCB cb = delegate(IntPtr h, IntPtr l) {
+      if (h == mine) return true;
+      var cls = new System.Text.StringBuilder(64); GetClassNameW(h, cls, cls.Capacity);
+      if (cls.ToString() != "ConsoleWindowClass") return true;
+      var t = new System.Text.StringBuilder(512); GetWindowTextW(h, t, t.Capacity);
+      if (t.ToString().IndexOf("HERMES-CONSOLE", System.StringComparison.OrdinalIgnoreCase) < 0) return true;
+      PostMessageW(h, 0x0010, IntPtr.Zero, IntPtr.Zero);   // WM_CLOSE
+      closed++;
+      return true;
+    };
+    EnumWindows(cb, IntPtr.Zero);
+    return closed;
+  }
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern uint MapVirtualKeyW(uint code, uint mapType);
   // ---- window PLACEMENT: what the user did by hand (maximized / moved / resized) ----
   // GetWindowPlacement/SetWindowPlacement is the canonical Win32 pair for this: unlike
@@ -470,6 +498,10 @@ $Host.UI.RawUI.WindowTitle = 'HERMES-CONSOLE'
 # ANY reason (kill, crash, reboot of the session) the OS closes our handle and the whole tree —
 # including their console windows — is destroyed. Without this, orphans kept zombie windows.
 if ([WinCon]::SetupSelfJob()) { Log 'bridge: self-job armed (KILL_ON_JOB_CLOSE) - console tree dies with us' } else { Log 'bridge: self-job FAILED - orphan windows possible' }
+# One-console invariant: sweep zombie HERMES-CONSOLE windows left by dead bridge generations.
+# Runs in OUR interactive session (an SSH-side EnumWindows would see session 0's empty station).
+$zombies = [WinCon]::CloseForeignHermesConsoles()
+if ($zombies -gt 0) { Log ('bridge: closed ' + $zombies + ' zombie HERMES-CONSOLE window(s) from dead generations') }
 $child = Start-Process -FilePath cmd.exe -WorkingDirectory $workDir -NoNewWindow -PassThru
 Log 'bridge: child cmd started, entering accept loop'
 $script:hidden = $true   # visibility policy owned by the bridge; tray toggles it via TCP
