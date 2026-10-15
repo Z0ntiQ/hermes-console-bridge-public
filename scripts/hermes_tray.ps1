@@ -843,7 +843,7 @@ $timer.Add_Tick({
   if ($wdNow.Length -gt 40) { $wdNow = '...' + $wdNow.Substring($wdNow.Length - 37) }   # tooltip cap
   if ($state -ne $script:lastState -or $epNow -ne $script:lastEp -or $wdNow -ne $script:lastWd) {
     $script:ni.Icon = Make-Icon $state
-    $script:ni.Text = $(switch ($state) {
+    $tip = $(switch ($state) {
       'red'    { 'HERMES-CONSOLE - bridge DOWN' }
       'yellow' { 'HERMES-CONSOLE - bridge BUSY (working)' }
       'green'  { 'HERMES-CONSOLE - agent WORKING' }
@@ -852,8 +852,12 @@ $timer.Add_Tick({
     $tl2 = @($script:status['tablist'])
     if ($tl2.Count -gt 0) {
       $vis = 0; foreach ($t in $tl2) { if ($t.visible) { $vis++ } }
-      $script:ni.Text += ' | tabs: ' + $tl2.Count + ' (' + $vis + ' shown)'
+      $tip += ' | tabs: ' + $tl2.Count + ' (' + $vis + ' shown)'
     }
+    # HARD CAP: NotifyIcon.Text throws ArgumentException over 63 chars on .NET Framework
+    # (PS 5.1) — an unclamped tooltip killed the tray with a .NET crash dialog on the monitor.
+    if ($tip.Length -gt 63) { $tip = $tip.Substring(0, 63) }
+    $script:ni.Text = $tip
     $script:lastState = $state
     $script:lastEp = $epNow
     $script:lastWd = $wdNow
