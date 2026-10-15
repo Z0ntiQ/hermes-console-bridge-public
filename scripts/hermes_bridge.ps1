@@ -91,6 +91,52 @@ public class WinCon {
   [StructLayout(LayoutKind.Sequential)]
   public struct RECT { public int Left, Top, Right, Bottom; }
   [DllImport("user32.dll")] public static extern int GetSystemMetrics(int n);
+  // ---- Job object: the whole console tree must die WITH the bridge ----
+  // Root cause of desktop litter: when the bridge was killed/crashed, its cmd.exe and
+  // everything started inside the console survived as orphans, each keeping a zombie
+  // console window (45+ of them after the 14 Oct restart storm). A kill-on-close job
+  // assigned to the bridge itself makes Windows destroy the entire tree — cmd, nested
+  // powershell, their windows — the instant the bridge handle closes.
+  [StructLayout(LayoutKind.Sequential)]
+  public struct IO_COUNTERS { public ulong ReadBytes, WriteBytes, OtherBytes, ReadOps, WriteOps, OtherOps; }
+  [StructLayout(LayoutKind.Sequential)]
+  public struct JOBOBJECT_BASIC_LIMIT_INFORMATION {
+    public long PerProcessUserTimeLimit, PerJobUserTimeLimit;
+    public uint LimitFlags;
+    public UIntPtr MinimumWorkingSetSize, MaximumWorkingSetSize;
+    public uint ActiveProcessLimit;
+    public UIntPtr Affinity;
+    public uint PriorityClass, SchedulingClass;
+  }
+  [StructLayout(LayoutKind.Sequential)]
+  public struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+    public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation;
+    public IO_COUNTERS IoInfo;
+    public UIntPtr ProcessMemoryLimit, JobMemoryLimit, PeakProcessMemoryUsed, PeakJobMemoryUsed;
+  }
+  [DllImport("kernel32.dll", SetLastError=true)] public static extern IntPtr CreateJobObject(IntPtr sa, string name);
+  [DllImport("kernel32.dll", SetLastError=true)] public static extern bool SetInformationJobObject(IntPtr job, int cls, IntPtr info, uint len);
+  [DllImport("kernel32.dll", SetLastError=true)] public static extern bool AssignProcessToJobObject(IntPtr job, IntPtr proc);
+  [DllImport("kernel32.dll", SetLastError=true)] public static extern bool CloseHandle(IntPtr h);
+  [DllImport("kernel32.dll")] public static extern IntPtr GetCurrentProcess();
+  static IntPtr s_job = IntPtr.Zero;
+  public static bool SetupSelfJob() {
+    // Must run BEFORE any child is started: membership is inherited, so every process the
+    // console tree spawns joins the job automatically. KILL_ON_JOB_CLOSE (0x2000) does the rest.
+    IntPtr job = CreateJobObject(IntPtr.Zero, null);
+    if (job == IntPtr.Zero) return false;
+    int size = Marshal.SizeOf(typeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION));
+    IntPtr info = Marshal.AllocHGlobal(size);
+    try {
+      JOBOBJECT_EXTENDED_LIMIT_INFORMATION li = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
+      li.BasicLimitInformation.LimitFlags = 0x2000;   // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+      Marshal.StructureToPtr(li, info, false);
+      if (!SetInformationJobObject(job, 9, info, (uint)size)) { CloseHandle(job); return false; }   // 9 = JobObjectExtendedLimitInformation
+    } finally { Marshal.FreeHGlobal(info); }
+    if (!AssignProcessToJobObject(job, GetCurrentProcess())) { CloseHandle(job); return false; }
+    s_job = job;   // keep open for our lifetime; the OS closes it when we die, and that kills the tree
+    return true;
+  }
   public static string PosStr() {
     var h = GetConsoleWindow();
     if (h == IntPtr.Zero) return "NO-HWND";
@@ -98,6 +144,31 @@ public class WinCon {
     return "POS " + r.Left + "x" + r.Top + " (" + (r.Right - r.Left) + "x" + (r.Bottom - r.Top) + "px)";
   }
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern uint MapVirtualKeyW(uint code, uint mapType);
+  // ---- window PLACEMENT: what the user did by hand (maximized / moved / resized) ----
+  // GetWindowPlacement/SetWindowPlacement is the canonical Win32 pair for this: unlike
+  // GetWindowRect it separates the NORMAL rect from the maximized state (showCmd), so a
+  // maximized window survives hide->show instead of collapsing to its default size.
+  [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
+  [StructLayout(LayoutKind.Sequential)]
+  public struct WINDOWPLACEMENT {
+    public int length; public int flags; public int showCmd;
+    public POINT ptMinPosition; public POINT ptMaxPosition; public RECT rcNormalPosition;
+  }
+  [DllImport("user32.dll", SetLastError=true)] public static extern bool GetWindowPlacement(IntPtr h, ref WINDOWPLACEMENT wp);
+  [DllImport("user32.dll", SetLastError=true)] public static extern bool SetWindowPlacement(IntPtr h, ref WINDOWPLACEMENT wp);
+  [DllImport("user32.dll")] public static extern bool IsZoomed(IntPtr h);
+  public static string PlacementStr() {
+    var h = GetConsoleWindow();
+    if (h == IntPtr.Zero) return "NO-HWND";
+    WINDOWPLACEMENT wp = new WINDOWPLACEMENT();
+    wp.length = System.Runtime.InteropServices.Marshal.SizeOf(typeof(WINDOWPLACEMENT));
+    if (!GetWindowPlacement(h, ref wp)) return "PLACEMENT-FAIL";
+    RECT r; GetWindowRect(h, out r);
+    return "PLACEMENT showCmd=" + wp.showCmd + " zoom=" + (IsZoomed(h) ? 1 : 0) +
+           " normal=" + wp.rcNormalPosition.Left + "," + wp.rcNormalPosition.Top + "," +
+                        wp.rcNormalPosition.Right + "," + wp.rcNormalPosition.Bottom +
+           " now=" + (r.Right - r.Left) + "x" + (r.Bottom - r.Top) + "px @" + r.Left + "x" + r.Top;
+  }
   public static IntPtr In = GetStdHandle(-10);
   public static IntPtr Out = GetStdHandle(-11);
   public static void Send(string s) {
@@ -276,6 +347,70 @@ function Restore-History {
     Log ('hist-restore: replayed ' + $lines.Count + ' lines into the new console')
   } catch { Log ('hist-restore failed: ' + $_.Exception.Message) }
 }
+
+# ---- window geometry persistence (user rule 2026-10-15: if he maximized / resized / moved the
+# window by hand, Hide -> Show must bring it back EXACTLY as he left it, not the defaults).
+# One line: "<showCmd> <L> <T> <R> <B>" (showCmd 1=normal, 3=maximized; rect = normal position).
+$geomFile = Join-Path $here 'hermes_geom.txt'
+function Get-Placement {
+  $h = [WinCon]::GetConsoleWindow()
+  if ($h -eq [IntPtr]::Zero) { return $null }
+  try {
+    $wp = New-Object WinCon+WINDOWPLACEMENT
+    $wp.length = [System.Runtime.InteropServices.Marshal]::SizeOf($wp)
+    if (-not [WinCon]::GetWindowPlacement($h, [ref] $wp)) { return $null }
+    return $wp
+  } catch { Log ('geom: placement read failed: ' + $_.Exception.Message); return $null }
+}
+function Save-Geom {
+  $wp = Get-Placement
+  if (-not $wp) { return }
+  # Only normal(1)/maximized(3) are worth remembering: hidden(0)/minimized(2) are transient
+  # system states, and overwriting with them would erase the user's real choice.
+  if (([int] $wp.showCmd) -ne 1 -and ([int] $wp.showCmd) -ne 3) { return }
+  try {
+    $r = $wp.rcNormalPosition
+    $txt = ([int] $wp.showCmd).ToString() + ' ' + $r.Left + ' ' + $r.Top + ' ' + $r.Right + ' ' + $r.Bottom
+    [System.IO.File]::WriteAllText($geomFile, $txt, [System.Text.UTF8Encoding]::new($false))
+  } catch { Log ('geom-save failed: ' + $_.Exception.Message) }
+}
+function Restore-Geom([string] $why) {
+  # Apply the placement the user left behind. Returns the showCmd to pass to ShowWindow
+  # (1=SW_SHOWNORMAL, 3=SW_SHOWMAXIMIZED) or 0 when there is no usable saved geometry
+  # (caller keeps its own defaults). Never throws: a bad file falls back to defaults.
+  # NOTE: SetWindowPlacement on a HIDDEN window sets the rect but neither shows the window
+  # nor keeps maximized state — the caller must ShowWindow() with the returned code.
+  $wp = Get-Placement
+  if (-not $wp) { return 0 }
+  try {
+    if (-not (Test-Path $geomFile)) { return 0 }
+    $p = @(([System.IO.File]::ReadAllText($geomFile)) -replace "^\uFEFF" -split '\s+' | Where-Object { $_ -ne '' })
+    if ($p.Count -lt 5) { Log 'geom: file malformed - using defaults'; return 0 }
+    $showCmd = [int] $p[0]
+    if ($showCmd -ne 3) { $showCmd = 1 }   # only maximized or normal; minimized is never a goal
+    $L = [int] $p[1]; $T = [int] $p[2]; $R = [int] $p[3]; $B = [int] $p[4]
+    if (($R - $L) -lt 60 -or ($B - $T) -lt 40) { Log 'geom: saved rect too small - using defaults'; return 0 }
+    # monitor layout can change between sessions: keep the window reachable on the current screen
+    $vsL = [WinCon]::GetSystemMetrics(76); $vsT = [WinCon]::GetSystemMetrics(77)
+    $vsR = $vsL + [WinCon]::GetSystemMetrics(78) - 1; $vsB = $vsT + [WinCon]::GetSystemMetrics(79) - 1
+    if ($R -lt $vsL -or $L -gt $vsR -or $B -lt $vsT -or $T -gt $vsB) {
+      $w = $R - $L; $ht = $B - $T
+      $L = [Math]::Max($vsL, [Math]::Min($L, $vsR - 40)); $T = [Math]::Max($vsT, [Math]::Min($T, $vsB - 40))
+      $R = $L + $w; $B = $T + $ht
+      Log 'geom: saved rect was off-screen (monitor change) - position pulled back inside'
+    }
+    $rc = New-Object WinCon+RECT
+    $rc.Left = $L; $rc.Top = $T; $rc.Right = $R; $rc.Bottom = $B
+    $wp.showCmd = $showCmd
+    $wp.rcNormalPosition = $rc
+    if (-not [WinCon]::SetWindowPlacement([WinCon]::GetConsoleWindow(), [ref] $wp)) {
+      Log ('geom: SetWindowPlacement failed (' + [System.Runtime.InteropServices.Marshal]::GetLastWin32Error() + ') - using defaults')
+      return 0
+    }
+    Log ('geom(' + $why + '): restored showCmd=' + $showCmd + ' normal=' + $L + ',' + $T + ' ' + ($R - $L) + 'x' + ($B - $T) + 'px')
+    return $showCmd
+  } catch { Log ('geom-restore failed: ' + $_.Exception.Message); return 0 }
+}
 try { $bindIp = [System.Net.IPAddress]::Parse($bindStr) }
 catch { $bindIp = ([System.Net.Dns]::GetHostAddresses($bindStr) | Where-Object { $_.AddressFamily -eq 'InterNetwork' } | Select-Object -First 1) }
 if (-not $bindIp) { $bindIp = [System.Net.IPAddress]::Loopback }
@@ -304,16 +439,19 @@ try {
   [WinCon]::SetWindow(87, 16) | Out-Null
   Log 'setup: font Lucida Console 6x10'
   [WinCon]::ApplyFont('Lucida Console', 6, 10) | Out-Null
-  # Window position on the monitor — user-specified exact top-left corner: 1366 x 844 px.
-  # SetWindowPos keeps the current size (SWP_NOSIZE); clamp so a corner never lands off-screen.
-  $px = 1366; $py = 844
-  $vsL = [WinCon]::GetSystemMetrics(76); $vsT = [WinCon]::GetSystemMetrics(77)   # virtual-screen origin
-  $vsR = $vsL + [WinCon]::GetSystemMetrics(78) - 1; $vsB = $vsT + [WinCon]::GetSystemMetrics(79) - 1
-  $r = New-Object WinCon+RECT
-  [WinCon]::GetWindowRect($hSetup, [ref]$r) | Out-Null
-  $px = [Math]::Max($vsL, [Math]::Min($px, $vsR - 40))
-  $py = [Math]::Max($vsT, [Math]::Min($py, $vsB - 40))
-  [WinCon]::SetWindowPos($hSetup, [IntPtr]::Zero, $px, $py, 0, 0, 0x0001) | Out-Null   # SWP_NOSIZE
+  # Window geometry: if the user left a placement (maximized / his size / his position) from a
+  # previous session, replay it — his hand-made layout wins over the defaults. Only with no
+  # saved file we apply the default top-left corner 1366 x 844 px (user-specified once).
+  if (-not (Restore-Geom 'startup')) {
+    $px = 1366; $py = 844
+    $vsL = [WinCon]::GetSystemMetrics(76); $vsT = [WinCon]::GetSystemMetrics(77)   # virtual-screen origin
+    $vsR = $vsL + [WinCon]::GetSystemMetrics(78) - 1; $vsB = $vsT + [WinCon]::GetSystemMetrics(79) - 1
+    $r = New-Object WinCon+RECT
+    [WinCon]::GetWindowRect($hSetup, [ref]$r) | Out-Null
+    $px = [Math]::Max($vsL, [Math]::Min($px, $vsR - 40))
+    $py = [Math]::Max($vsT, [Math]::Min($py, $vsB - 40))
+    [WinCon]::SetWindowPos($hSetup, [IntPtr]::Zero, $px, $py, 0, 0, 0x0001) | Out-Null   # SWP_NOSIZE
+  }
   Log ('setup: position ' + [WinCon]::PosStr())
   # Colors: SetConsoleScreenBufferInfoEx FAILS on this conhost (Get itself returns false — probe-verified).
   # The reliable equivalent of the Colors tab is the cmd built-in: `color 1f` sets the default
@@ -327,6 +465,11 @@ if ($h0 -ne [IntPtr]::Zero) { [WinCon]::ShowWindow($h0, 0) | Out-Null }   # SW_H
 Write-Host "HERMES-CONSOLE bridge up on 127.0.0.1:$port - Hermes drives this window. CWD: $workDir"
 Write-Host "Console hidden - open it from the HERMES tray icon (near the clock)."
 $Host.UI.RawUI.WindowTitle = 'HERMES-CONSOLE'
+# Kill-on-close job, assigned to OURSELVES before any child exists: membership is inherited by
+# everything the console tree spawns (cmd, nested powershell, tools). When the bridge dies for
+# ANY reason (kill, crash, reboot of the session) the OS closes our handle and the whole tree —
+# including their console windows — is destroyed. Without this, orphans kept zombie windows.
+if ([WinCon]::SetupSelfJob()) { Log 'bridge: self-job armed (KILL_ON_JOB_CLOSE) - console tree dies with us' } else { Log 'bridge: self-job FAILED - orphan windows possible' }
 $child = Start-Process -FilePath cmd.exe -WorkingDirectory $workDir -NoNewWindow -PassThru
 Log 'bridge: child cmd started, entering accept loop'
 $script:hidden = $true   # visibility policy owned by the bridge; tray toggles it via TCP
@@ -413,26 +556,39 @@ while ($true) {
       } elseif ($op.op -eq 'show') {
         $hwnd = [WinCon]::GetConsoleWindow()
         if ($hwnd -ne [IntPtr]::Zero) {
-          [WinCon]::ShowWindow($hwnd, 9) | Out-Null          # SW_RESTORE
+          # Restore what the USER left (maximized / his size / his position) — user rule:
+          # hand-made geometry must survive Hide->Show. SetWindowPlacement alone does not
+          # show a hidden window nor keep maximize: ShowWindow with the saved showCmd does.
+          $sc = Restore-Geom 'show'
+          if ($sc -ne 0) {
+            [WinCon]::ShowWindow($hwnd, $sc) | Out-Null       # 1=SW_SHOWNORMAL 3=SW_SHOWMAXIMIZED
+          } else {
+            [WinCon]::ShowWindow($hwnd, 9) | Out-Null          # SW_RESTORE (no saved geometry)
+            # conhost moves the window back on restore — re-assert the user position 1366x844.
+            $vsL = [WinCon]::GetSystemMetrics(76); $vsT = [WinCon]::GetSystemMetrics(77)
+            $vsR = $vsL + [WinCon]::GetSystemMetrics(78) - 1; $vsB = $vsT + [WinCon]::GetSystemMetrics(79) - 1
+            $r = New-Object WinCon+RECT
+            [WinCon]::GetWindowRect($hwnd, [ref]$r) | Out-Null
+            $nx = [Math]::Max($vsL, [Math]::Min(1366, $vsR - 40))
+            $ny = [Math]::Max($vsT, [Math]::Min(844,  $vsB - 40))
+            [WinCon]::SetWindowPos($hwnd, [IntPtr]::Zero, $nx, $ny, 0, 0, 0x0001) | Out-Null   # SWP_NOSIZE
+          }
           [WinCon]::SetForegroundWindow($hwnd) | Out-Null
-          # conhost moves the window back on restore — re-assert the user position 1366x844.
-          $vsL = [WinCon]::GetSystemMetrics(76); $vsT = [WinCon]::GetSystemMetrics(77)
-          $vsR = $vsL + [WinCon]::GetSystemMetrics(78) - 1; $vsB = $vsT + [WinCon]::GetSystemMetrics(79) - 1
-          $r = New-Object WinCon+RECT
-          [WinCon]::GetWindowRect($hwnd, [ref]$r) | Out-Null
-          $nx = [Math]::Max($vsL, [Math]::Min(1366, $vsR - 40))
-          $ny = [Math]::Max($vsT, [Math]::Min(844,  $vsB - 40))
-          [WinCon]::SetWindowPos($hwnd, [IntPtr]::Zero, $nx, $ny, 0, 0, 0x0001) | Out-Null   # SWP_NOSIZE
         }
         $script:hidden = $false
-        Log ('loop: show (user opened from tray) ' + [WinCon]::PosStr())
-        Reply $ns ('shown ' + [WinCon]::PosStr()); Done $ns 'show'
+        Log ('loop: show (user opened from tray) ' + [WinCon]::PlacementStr())
+        Reply $ns ('shown ' + [WinCon]::PlacementStr()); Done $ns 'show'
       } elseif ($op.op -eq 'hide') {
         $hwnd = [WinCon]::GetConsoleWindow()
-        if ($hwnd -ne [IntPtr]::Zero) { [WinCon]::ShowWindow($hwnd, 0) | Out-Null }   # SW_HIDE
+        if ($hwnd -ne [IntPtr]::Zero) {
+          Save-Geom   # remember maximized/moved/resized state BEFORE hiding: Show must replay it
+          [WinCon]::ShowWindow($hwnd, 0) | Out-Null }   # SW_HIDE
         $script:hidden = $true
-        Log 'loop: hide (user hid from tray)'
+        Log ('loop: hide (user hid from tray) ' + [WinCon]::PlacementStr())
         Reply $ns 'hidden'; Done $ns 'hide'
+      } elseif ($op.op -eq 'geom') {
+        # fact-check for the agent/tray: current placement (showCmd, normal rect, live rect)
+        Reply $ns ([WinCon]::PlacementStr()); Done $ns 'geom'
       } elseif ($op.op -eq 'state') {
         Reply $ns $(if ($script:hidden) { 'HIDDEN' } else { 'VISIBLE' }); Done $ns 'state'
       } elseif ($op.op -eq 'history') {
@@ -463,6 +619,7 @@ while ($true) {
         Reply $ns ('pong ' + $s + ' ' + $script:opCount + ' ' + $vis); Done $ns 'hb'
       } elseif ($op.op -eq 'quit') {
         Save-History   # last chance: disk copy must match the screen when the session ends
+        Save-Geom      # last chance: the user's window layout must outlive this process
         try { $child | Stop-Process -Force -ErrorAction SilentlyContinue } catch {}
         Reply $ns 'bye'; Done $ns 'quit'
         $endConn = $true
@@ -471,7 +628,7 @@ while ($true) {
       }
       # disk copy of the scrollback after every work op (cheap: 400 buffer lines + one file write);
       # this is what makes a bridge restart invisible — the next boot replays these records.
-      if ($op.op -in @('keys','screen','history')) { Save-History }
+      if ($op.op -in @('keys','screen','history')) { Save-History; Save-Geom }
     }
   }
   $c.Close()

@@ -94,6 +94,8 @@ if __name__ == "__main__":
         run({"op": "hb"}, timeout=10)
     elif cmd == "wd":
         run({"op": "wd"})   # console default folder (what WORKDIR resolves to on the server)
+    elif cmd == "geom":
+        run({"op": "geom"})   # window placement: showCmd (1=normal 3=maximized), normal rect, live rect
     elif cmd == "screen":
         run({"op": "screen"})
     elif cmd == "history":
