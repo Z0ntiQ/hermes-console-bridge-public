@@ -6,7 +6,9 @@
 # ---- CONFIG: scripts/console.cfg (KEY=VALUE) or env vars (env wins) ----
 #   HOST=user@192.168.1.10   SSH target of the Windows server
 #   KEY=~/.ssh/id_ed25519    SSH private key
-#   PORT=18799               bridge TCP port (server-side listen AND local tunnel endpoint)
+#   PORT=18799               bridge TCP port of TAB 1 (server-side listen AND local tunnel endpoint)
+#   TABS=8                   number of console tabs; tab N listens on PORT+N-1 and the tunnel
+#                            forwards the whole range PORT..PORT+TABS-1
 #   TUNNEL=ssh|none          'none' = the tunnel is realized some other way (cloudflared,
 #                            Tailscale serve, socat, an already-open remote port...). Then this
 #                            script does NOT raise any ssh -L; it just verifies PORT is reachable.
@@ -25,6 +27,7 @@ cfg() { # cfg KEY DEFAULT  (env HC_KEY wins, then console.cfg, then default)
 HOST="$(cfg HOST '')"
 KEY="${KEY:-$(cfg KEY "$HOME/.ssh/id_ed25519")}"
 PORT="$(cfg PORT 18799)"
+TABS="$(cfg TABS 8)"
 TUNNEL="$(cfg TUNNEL ssh)"
 HC_HOST="${HC_HOST:-$(cfg HC_HOST 127.0.0.1)}"
 EXPECT_HOST="$(cfg EXPECT_HOST '')"
@@ -89,7 +92,7 @@ elif ! HC_HOST="$HC_HOST" python3 "$CLIENT" ping 2>/dev/null | grep -q pong; the
     PS="Get-CimInstance Win32_Process -Filter \"Name=\`\"powershell.exe\`\"\" | Where-Object { \$_.CommandLine -match \"hermes_bridge.ps1|hermes_tray.ps1\" } | ForEach-Object { Stop-Process -Id \$_.ProcessId -Force -ErrorAction SilentlyContinue }
 Get-CimInstance Win32_Process -Filter \"Name=\`\"cmd.exe\`\"\" | Where-Object { -not (Get-Process -Id \$_.ParentProcessId -ErrorAction SilentlyContinue) } | ForEach-Object { Stop-Process -Id \$_.ProcessId -Force -ErrorAction SilentlyContinue }
 Start-Sleep 2
-(Get-NetTCPConnection -LocalPort $PORT -State Listen -ErrorAction SilentlyContinue | Measure-Object).Count"
+@(1..$TABS | ForEach-Object { Get-NetTCPConnection -LocalPort ($PORT+\$_-1) -State Listen -ErrorAction SilentlyContinue } | Measure-Object).Count"
     LEFT="$(ps_run "$PS" | tr -dc '0-9')"
     echo "listeners after clear: ${LEFT:-?}"
     "${SSH[@]}" 'schtasks /run /tn HERMES-CONSOLE' >/dev/null 2>&1
@@ -101,9 +104,14 @@ fi
 
 # 3) Local SSH tunnel — only TUNNEL=ssh: always paired with the bridge, never raised separately.
 if [ "$TUNNEL" = "ssh" ]; then
+  # One -L per tab port: tabs are separate bridge processes on PORT..PORT+TABS-1, and the
+  # client probes that whole range, so a single-port tunnel would make tabs 2..N unreachable.
+  FWD=""
+  for ((i=0; i<TABS; i++)); do FWD="$FWD -L $((PORT+i)):127.0.0.1:$((PORT+i))"; done
   if ! lsof -nP -iTCP:$PORT -sTCP:LISTEN >/dev/null 2>&1; then
     pkill -f "$PORT:127.0.0.1:$PORT" 2>/dev/null
-    ssh -i "$KEY" -o BatchMode=yes -o StrictHostKeyChecking=no -o ExitOnForwardFailure=yes -f -N -L $PORT:127.0.0.1:$PORT "$HOST" || fail "tunnel raise failed"
+    # shellcheck disable=SC2086   # $FWD is deliberately word-split into ssh args
+    ssh -i "$KEY" -o BatchMode=yes -o StrictHostKeyChecking=no -o ExitOnForwardFailure=yes -f -N $FWD "$HOST" || fail "tunnel raise failed"
     sleep 1
   fi
   lsof -nP -iTCP:$PORT -sTCP:LISTEN >/dev/null 2>&1 || fail "tunnel not listening on $PORT"

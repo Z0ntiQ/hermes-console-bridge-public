@@ -13,13 +13,17 @@ cfg() {
 HOST="$(cfg HOST '')"
 KEY="${KEY:-$(cfg KEY "$HOME/.ssh/id_ed25519")}"
 PORT="$(cfg PORT 18799)"
+TABS="$(cfg TABS 8)"
 TUNNEL="$(cfg TUNNEL ssh)"
 HC_HOST="${HC_HOST:-$(cfg HC_HOST 127.0.0.1)}"
 CLIENT="$DIR/hermes_console_client.py"
 
-# 1) bridge self-quit (kills bridge + child cmd; history is saved first)
-HC_HOST="$HC_HOST" python3 "$CLIENT" quit >/dev/null 2>&1
-echo "bridge quit sent"
+# 1) bridge self-quit for EVERY tab: each bridge saves its own history/geometry on quit.
+#    A tab that is not up simply refuses the connect — harmless.
+for ((i=0; i<TABS; i++)); do
+  HC_HOST="$HC_HOST" python3 "$CLIENT" --port $((PORT+i)) quit >/dev/null 2>&1
+done
+echo "quit sent to tabs 1..$TABS"
 
 # 2) kill tray + bridge processes on the server (match their command lines).
 #    -EncodedCommand avoids all cross-shell quoting hell.
@@ -34,5 +38,5 @@ fi
 # 3) local tunnel (only ours; a foreign tunnel is not ours to kill)
 if [ "$TUNNEL" = "ssh" ]; then
   pkill -f "$PORT:127.0.0.1:$PORT" 2>/dev/null
-  echo "tunnel dropped"
+  echo "tunnel dropped (all tab forwards share one ssh process)"
 fi

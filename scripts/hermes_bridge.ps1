@@ -9,9 +9,18 @@
 #                         safe default; set a Tailscale/LAN IP only if you know why)
 #     PORT=18799          TCP port
 #     WORKDIR=E:\AI       console working directory
+#     TABS=8              max console tabs (tab N listens on PORT+N-1)
 #   Env overrides: HERMES_BIND / HERMES_PORT / HERMES_WORKDIR.
+# ---- TABS (user request 2026-10-15): several consoles, one bridge process PER TAB. ----
+# A real tab strip inside one window is impossible here: conhost has no tabs and one console has
+# exactly ONE input queue — while a tab runs a long-lived server (START.bat -> ComfyUI), its stdin
+# belongs to that server and no other command can be typed into it. So a tab = its own console
+# window + its own cmd child + its own port (base + tab - 1). The tray supervises the whole set and
+# the client addresses tabs by number. Tab 1 keeps the legacy port and the legacy file names.
+param([int] $Tab = 1, [string] $TabLabel = '', [string] $WorkDir = '')
 $ErrorActionPreference = 'Stop'
-$Host.UI.RawUI.WindowTitle = 'HERMES-CONSOLE'
+if ($Tab -lt 1 -or $Tab -gt 32) { Write-Error ('bad -Tab ' + $Tab); exit 2 }
+$TabTag = if ($Tab -eq 1) { '' } else { ('_T' + $Tab) }
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 function CfgVal($name, $default) {
   $v = [Environment]::GetEnvironmentVariable('HERMES_' + $name)
@@ -24,10 +33,15 @@ function CfgVal($name, $default) {
   }
   return $default
 }
-$port = [int] (CfgVal 'PORT' 18799)
+$basePort = [int] (CfgVal 'PORT' 18799)
+$MAX_TABS = [int] (CfgVal 'TABS' 8)          # tab N listens on basePort + N - 1
+$port = $basePort + ($Tab - 1)
 $bindStr = [string] (CfgVal 'BIND' '127.0.0.1')
-$workDir = [string] (CfgVal 'WORKDIR' 'E:\AI')
-$log = Join-Path $here 'hermes_bridge.log'   # logs/next to the script: deployable anywhere
+# Protocol v2 constants (defined early: the startup sibling-tab probe needs them)
+$REQ = 'HERMES-REQ-8F27:'; $RES = 'HERMES-RES-8F27:'; $DONE = 'HERMES-DONE-8F27:'
+# per-tab folder: -WorkDir wins (the tray passes it per tab), else global cfg WORKDIR
+$workDir = if ($WorkDir) { $WorkDir } else { [string] (CfgVal 'WORKDIR' 'E:\AI') }
+$log = Join-Path $here ('hermes_bridge' + $TabTag + '.log')   # per-tab log; tab 1 keeps the legacy name
 # hygiene: cap log growth — rotate once at startup (bridge restarts are rare), keep .old for triage
 if ((Test-Path $log) -and ((Get-Item $log).Length -gt 1MB)) {
   Move-Item $log ($log + '.old') -Force -ErrorAction SilentlyContinue
@@ -155,7 +169,10 @@ public class WinCon {
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowTextW(IntPtr h, System.Text.StringBuilder s, int n);
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassNameW(IntPtr h, System.Text.StringBuilder s, int n);
   [DllImport("user32.dll")] public static extern bool PostMessageW(IntPtr h, uint msg, IntPtr w, IntPtr l);
-  public static int CloseForeignHermesConsoles() {
+  // liveTabs = tab ids whose bridges answer the protocol right now. A window tagged [Tn] with a
+  // live n is a SIBLING TAB, not a zombie: with the tabs feature several HERMES-CONSOLE windows
+  // legitimately coexist, so the sweep must be tag-aware or it would close the user's other tabs.
+  public static int CloseForeignHermesConsoles(int[] liveTabs) {
     IntPtr mine = GetConsoleWindow();
     int closed = 0;
     EnumWinCB cb = delegate(IntPtr h, IntPtr l) {
@@ -163,7 +180,13 @@ public class WinCon {
       var cls = new System.Text.StringBuilder(64); GetClassNameW(h, cls, cls.Capacity);
       if (cls.ToString() != "ConsoleWindowClass") return true;
       var t = new System.Text.StringBuilder(512); GetWindowTextW(h, t, t.Capacity);
-      if (t.ToString().IndexOf("HERMES-CONSOLE", System.StringComparison.OrdinalIgnoreCase) < 0) return true;
+      string title = t.ToString();
+      if (title.IndexOf("HERMES-CONSOLE", System.StringComparison.OrdinalIgnoreCase) < 0) return true;
+      var m = System.Text.RegularExpressions.Regex.Match(title, @"\[T(\d+)\]");
+      int tabId = m.Success ? int.Parse(m.Groups[1].Value) : 1;   // untagged legacy title == tab 1
+      bool live = false;
+      if (liveTabs != null) foreach (int x in liveTabs) if (x == tabId) { live = true; break; }
+      if (live) return true;
       PostMessageW(h, 0x0010, IntPtr.Zero, IntPtr.Zero);   // WM_CLOSE
       closed++;
       return true;
@@ -355,7 +378,7 @@ Add-Type -Language CSharp -TypeDefinition $WinConSrc
 # ---- history persistence (user rule: after a bridge restart the new console must show the
 # previous records, several screens back, "as if nothing happened"). Plain rolling UTF-8 file:
 # no SQLite dependency, survives any crash, atomic-enough for a single writer. ----
-$histFile = Join-Path $here 'hermes_history.txt'
+$histFile = Join-Path $here ('hermes_history' + $TabTag + '.txt')
 $HIST_KEEP = 400          # lines kept in the file (~25 screens of 16 rows)
 function Save-History {
   try {
@@ -379,7 +402,7 @@ function Restore-History {
 # ---- window geometry persistence (user rule 2026-10-15: if he maximized / resized / moved the
 # window by hand, Hide -> Show must bring it back EXACTLY as he left it, not the defaults).
 # One line: "<showCmd> <L> <T> <R> <B>" (showCmd 1=normal, 3=maximized; rect = normal position).
-$geomFile = Join-Path $here 'hermes_geom.txt'
+$geomFile = Join-Path $here ('hermes_geom' + $TabTag + '.txt')
 function Get-Placement {
   $h = [WinCon]::GetConsoleWindow()
   if ($h -eq [IntPtr]::Zero) { return $null }
@@ -471,7 +494,8 @@ try {
   # previous session, replay it — his hand-made layout wins over the defaults. Only with no
   # saved file we apply the default top-left corner 1366 x 844 px (user-specified once).
   if (-not (Restore-Geom 'startup')) {
-    $px = 1366; $py = 844
+    # default corner, cascaded per tab so several tab windows never sit exactly on top of each other
+    $px = 1366 + (($Tab - 1) * 48); $py = 844 + (($Tab - 1) * 32)
     $vsL = [WinCon]::GetSystemMetrics(76); $vsT = [WinCon]::GetSystemMetrics(77)   # virtual-screen origin
     $vsR = $vsL + [WinCon]::GetSystemMetrics(78) - 1; $vsB = $vsT + [WinCon]::GetSystemMetrics(79) - 1
     $r = New-Object WinCon+RECT
@@ -490,9 +514,9 @@ Log ('bridge: console setup done -> ' + [WinCon]::FontInfo() + ', expect SIZE 87
 $h0 = [WinCon]::GetConsoleWindow()
 [WinCon]::LockClose($h0) | Out-Null   # X is disabled on purpose: closing = tray Hide/Quit
 if ($h0 -ne [IntPtr]::Zero) { [WinCon]::ShowWindow($h0, 0) | Out-Null }   # SW_HIDE
-Write-Host "HERMES-CONSOLE bridge up on 127.0.0.1:$port - Hermes drives this window. CWD: $workDir"
+Write-Host "HERMES-CONSOLE bridge up on 127.0.0.1:$port (tab $Tab) - Hermes drives this window. CWD: $workDir"
 Write-Host "Console hidden - open it from the HERMES tray icon (near the clock)."
-$Host.UI.RawUI.WindowTitle = 'HERMES-CONSOLE'
+$Host.UI.RawUI.WindowTitle = 'HERMES-CONSOLE [T' + $Tab + ']'
 # Kill-on-close job, assigned to OURSELVES before any child exists: membership is inherited by
 # everything the console tree spawns (cmd, nested powershell, tools). When the bridge dies for
 # ANY reason (kill, crash, reboot of the session) the OS closes our handle and the whole tree —
@@ -500,8 +524,31 @@ $Host.UI.RawUI.WindowTitle = 'HERMES-CONSOLE'
 if ([WinCon]::SetupSelfJob()) { Log 'bridge: self-job armed (KILL_ON_JOB_CLOSE) - console tree dies with us' } else { Log 'bridge: self-job FAILED - orphan windows possible' }
 # One-console invariant: sweep zombie HERMES-CONSOLE windows left by dead bridge generations.
 # Runs in OUR interactive session (an SSH-side EnumWindows would see session 0's empty station).
-$zombies = [WinCon]::CloseForeignHermesConsoles()
-if ($zombies -gt 0) { Log ('bridge: closed ' + $zombies + ' zombie HERMES-CONSOLE window(s) from dead generations') }
+# Which tabs are alive right now? A sibling bridge that answers hb owns a LEGITIMATE window.
+function Get-LiveTabs([int] $selfTab, [int] $baseP) {
+  $live = New-Object 'System.Collections.Generic.List[int]'
+  $live.Add($selfTab)
+  for ($t = 1; $t -le $MAX_TABS; $t++) {
+    if ($t -eq $selfTab) { continue }
+    try {
+      $tc = New-Object System.Net.Sockets.TcpClient
+      $ar = $tc.BeginConnect([System.Net.IPAddress]::Loopback, ($baseP + $t - 1), $null, $null)
+      if (-not $ar.AsyncWaitHandle.WaitOne(250)) { $tc.Close(); continue }
+      try { $tc.EndConnect($ar) } catch { $tc.Close(); continue }
+      $s2 = $tc.GetStream(); $s2.ReadTimeout = 700
+      $b2 = [System.Text.Encoding]::UTF8.GetBytes($REQ + '{"op":"hb"}' + "`n")
+      $s2.Write($b2, 0, $b2.Length); $s2.Flush()
+      $buft = New-Object byte[] 512; $n2 = 0
+      try { $n2 = $s2.Read($buft, 0, $buft.Length) } catch { $n2 = 0 }
+      $tc.Close()
+      if ($n2 -gt 0 -and [System.Text.Encoding]::UTF8.GetString($buft, 0, $n2).Contains('pong ')) { $live.Add($t) }
+    } catch {}
+  }
+  return , $live.ToArray()
+}
+$liveTabs = Get-LiveTabs $Tab $basePort
+$zombies = [WinCon]::CloseForeignHermesConsoles($liveTabs)
+if ($zombies -gt 0) { Log ('bridge: closed ' + $zombies + ' zombie HERMES-CONSOLE window(s) (live tabs: ' + ($liveTabs -join ',') + ')') }
 $child = Start-Process -FilePath cmd.exe -WorkingDirectory $workDir -NoNewWindow -PassThru
 Log 'bridge: child cmd started, entering accept loop'
 $script:hidden = $true   # visibility policy owned by the bridge; tray toggles it via TCP
@@ -529,7 +576,6 @@ $script:opCount = 0   # console WORK ops served (keys/screen/show/hide/state) �
 # Request  : HERMES-REQ:<json>            (lines without this prefix are ignored)
 # Response : HERMES-RES:<line>  x N       (payload, one prefixed line per line)
 # End      : HERMES-DONE:<op>             (exactly one per request)
-$REQ = 'HERMES-REQ-8F27:'; $RES = 'HERMES-RES-8F27:'; $DONE = 'HERMES-DONE-8F27:'
 function Reply($ns, [string]$s) {
   $out = ''
   foreach ($l in (($s -split "`r?`n") -join "`n" -split "`n")) { $out += $RES + $l + "`n" }
@@ -601,8 +647,8 @@ while ($true) {
             $vsR = $vsL + [WinCon]::GetSystemMetrics(78) - 1; $vsB = $vsT + [WinCon]::GetSystemMetrics(79) - 1
             $r = New-Object WinCon+RECT
             [WinCon]::GetWindowRect($hwnd, [ref]$r) | Out-Null
-            $nx = [Math]::Max($vsL, [Math]::Min(1366, $vsR - 40))
-            $ny = [Math]::Max($vsT, [Math]::Min(844,  $vsB - 40))
+            $nx = [Math]::Max($vsL, [Math]::Min((1366 + (($Tab - 1) * 48)), $vsR - 40))
+            $ny = [Math]::Max($vsT, [Math]::Min((844  + (($Tab - 1) * 32)), $vsB - 40))
             [WinCon]::SetWindowPos($hwnd, [IntPtr]::Zero, $nx, $ny, 0, 0, 0x0001) | Out-Null   # SWP_NOSIZE
           }
           [WinCon]::SetForegroundWindow($hwnd) | Out-Null
@@ -618,6 +664,21 @@ while ($true) {
         $script:hidden = $true
         Log ('loop: hide (user hid from tray) ' + [WinCon]::PlacementStr())
         Reply $ns 'hidden'; Done $ns 'hide'
+      } elseif ($op.op -eq 'newtab' -or $op.op -eq 'closetab') {
+        # tab lifecycle belongs to the tray (it lives in the interactive session and owns the
+        # icon): write the request into the tray's command seam instead of doing it here.
+        $seam = Join-Path $here 'tray_cmd.txt'
+        $verb = if ($op.op -eq 'newtab') {
+          $lbl = if ($op.label) { [string] $op.label } else { '' }
+          $wdp = if ($op.workdir) { [string] $op.workdir } else { '' }
+          ('!addtab ' + $lbl + '|' + $wdp)
+        } else { ('!closetab ' + [int] $op.tab) }
+        try {
+          Add-Content -Path $seam -Value ('!file ' + $verb) -Encoding UTF8
+          Reply $ns ('queued: ' + $verb + ' (the tray applies it in the desktop session)'); Done $ns $op.op
+        } catch { Reply $ns ('ERR cannot write ' + $seam + ': ' + $_.Exception.Message); Done $ns $op.op }
+      } elseif ($op.op -eq 'tab') {
+        Reply $ns ('T' + $Tab + ' port=' + $port + ' label=' + $TabLabel); Done $ns 'tab'
       } elseif ($op.op -eq 'geom') {
         # fact-check for the agent/tray: current placement (showCmd, normal rect, live rect)
         Reply $ns ([WinCon]::PlacementStr()); Done $ns 'geom'

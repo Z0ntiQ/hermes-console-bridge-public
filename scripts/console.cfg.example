@@ -8,8 +8,12 @@ HOST=user@192.168.1.10
 # SSH private key (full path; default: ~/.ssh/id_ed25519)
 #KEY=/home/me/.ssh/id_ed25519
 
-# bridge TCP port (server-side listen AND local tunnel endpoint)
+# bridge TCP port of TAB 1 (server-side listen AND local tunnel endpoint).
+# Tabs are separate consoles on PORT..PORT+TABS-1; the tunnel forwards the whole range.
 PORT=18799
+
+# number of console tabs (default 8; tab N listens on PORT+N-1)
+#TABS=8
 
 # TUNNEL=ssh   -> this script raises its own "ssh -L PORT:127.0.0.1:PORT" (default)
 # TUNNEL=none  -> the tunnel is realized some other way (cloudflared, Tailscale serve,

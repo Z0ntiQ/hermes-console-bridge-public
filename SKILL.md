@@ -70,14 +70,14 @@ Mac (hermes_console_client.py)
    ```bash
    sed 's/$/\r/' hermes_bridge.ps1 > /tmp/hb_crlf.ps1
    sed 's/$/\r/' hermes_console.bat > /tmp/hc_crlf.bat
-   scp -i ~/.ssh/id_ed25519 -o BatchMode=yes /tmp/hb_crlf.ps1 user@192.168.1.10:E:/LOCAL_HERMES/hermes_bridge.ps1
-   scp -i ~/.ssh/id_ed25519 -o BatchMode=yes /tmp/hc_crlf.bat  user@192.168.1.10:E:/LOCAL_HERMES/hermes_console.bat
+   scp -i ~/.ssh/id_ed25519 -o BatchMode=yes /tmp/hb_crlf.ps1 user@server.example:E:/LOCAL_HERMES/hermes_bridge.ps1
+   scp -i ~/.ssh/id_ed25519 -o BatchMode=yes /tmp/hc_crlf.bat  user@server.example:E:/LOCAL_HERMES/hermes_console.bat
    ```
 
 ## Manual fallback: start the window (only if console_up.sh fails)
 
 ```bash
-WSSH="ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=20 user@192.168.1.10"
+WSSH="ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=20 user@server.example"
 $WSSH 'schtasks /create /tn HERMES-CONSOLE /tr "E:\LOCAL_HERMES\hermes_console.bat" /sc once /st 00:00 /it /f'
 $WSSH 'schtasks /run /tn HERMES-CONSOLE'
 sleep 6
@@ -91,7 +91,7 @@ The tunnel is normally raised by `console_up.sh` — raise it by hand only to re
 ```bash
 # tunnel (idempotent: kill old first)
 pkill -f "18799:127.0.0.1:18799"
-ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o StrictHostKeyChecking=no -o ExitOnForwardFailure=yes -f -N -L 18799:127.0.0.1:18799 user@192.168.1.10
+ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o StrictHostKeyChecking=no -o ExitOnForwardFailure=yes -f -N -L 18799:127.0.0.1:18799 user@server.example
 lsof -nP -iTCP:18799 -sTCP:LISTEN   # verify
 ```
 
@@ -109,8 +109,8 @@ request : HERMES-REQ-8F27:<json>      (bridge IGNORES any line without this pref
 payload : HERMES-RES-8F27:<line>      (repeated, one per screen line)
 end     : HERMES-DONE-8F27:<op>       (exactly one per request; no DONE = bridge unhealthy)
 ```
-Ops: `ping`, `hb` (one round trip: `pong <secs> <opCount> <VISIBLE|HIDDEN>`), `state`, `screen`, `history {lines}`, `keys {text}` (INSTANT — `wait` param removed, see Workflow discipline), `show`, `hide`, `activity`, `sysmenu`, `quit`. Special chars in `text`: `\r` Enter, `\b` Backspace, `\t` Tab, `\u0003` Ctrl+C, `\u001b` Esc.
-Other fixed unique identifiers: scheduled task `HERMES-CONSOLE`, tray mutex `HERMES-CONSOLE-TRAY`, logs `hermes_task.log` / `hermes_tray.log` / `hermes_bridge.log` under `E:\LOCAL_HERMES`, window title `HERMES-CONSOLE`, port `18799`. Test markers typed into the window: `HERMES-` prefixed (e.g. `echo HERMES-PFX-V2-OK`).
+Ops: `ping`, `hb` (one round trip: `pong <secs> <opCount> <VISIBLE|HIDDEN>`), `state`, `screen`, `history {lines}`, `keys {text}` (INSTANT — `wait` param removed, see Workflow discipline), `show`, `hide`, `activity`, `sysmenu`, `wd`, `geom`, `tab` (this tab's number/label/port), `newtab {label,dir}` / `closetab {tab}` (write `!addtab`/`!closetab` into tray_cmd.txt — the bridge CANNOT create a session-1 console itself), `quit`. Client: `--tab N` addresses tab N (port BASE+N-1); commands `tabs` (probes the whole port range, `hb`-answering = open), `newtab "label" "dir"`, `closetab N`. Special chars in `text`: `\r` Enter, `\b` Backspace, `\t` Tab, `\u0003` Ctrl+C, `\u001b` Esc.
+Other fixed unique identifiers: scheduled task `HERMES-CONSOLE`, tray mutex `HERMES-CONSOLE-TRAY`, logs `hermes_task.log` / `hermes_tray.log` / `hermes_bridge.log` under `E:\LOCAL_HERMES` (tray log = script dir `hermes_tray.log`, NOT %LOCALAPPDATA%), window title `HERMES-CONSOLE [Tn]` (tab tag; tab 1 keeps the HERMES-CONSOLE prefix), base port `18799`, tab N port `18799+N-1`, `TABS` cap (default 8). Test markers typed into the window: `HERMES-` prefixed (e.g. `echo HERMES-PFX-V2-OK`).
 `show`/`hide` are sent by the tray over TCP to the bridge — the bridge owns its console window; the tray never finds it by title (unreliable across conhost versions).
 
 ## Workflow discipline
@@ -120,6 +120,8 @@ Other fixed unique identifiers: scheduled task `HERMES-CONSOLE`, tray mutex `HER
 - Default folder (tray v3.3, user: «добавить функцию добавления папки по умолчанию - а не жестко закрепленный вариант»): the menu has a **Folder** section — disabled label `Folder: <path>` (Add_Opening reads `status['workdir']`, middle-trims long paths) + **Set default folder...** (FolderBrowserDialog, pure UI, enqueues `!setwd <path>`). Worker: refuses a path that is an existing FILE (balloon warning, no change), `Upsert-CfgKey 'WORKDIR'` into hermes_console.cfg (generic key upsert shared with BIND/PORT — no more per-key Upsert-Cfg), then enqueues `!restart` + `$immediate`: the relaunched bridge reads cfg and starts cmd.exe in the new folder (a missing folder is CREATED by the bridge, verified live with `E:\AI\newdemo`). History file lives next to the scripts, NOT in WORKDIR — folder switches never lose scrollback. Truth source is the bridge: op `{"op":"wd"}` replies `$workDir` (client command `wd`); the worker re-fetches every ~15 hb polls so manual cfg edits stay visible in the tooltip (`... @ <endpoint> | <folder>`). Seam: `!setwd <path>` in
   tray_cmd.txt (verified live: cfg WORKDIR rewritten, bridge relaunched there, refusal path
   logged `setwd: refused, path is a file`).
+- Window geometry persistence (bridge, user rule 2026-10-15: «развернул в полный экран, поменял размер/позицию, Hide→Show — должно воспроизводиться, а не дефолт»): the bridge saves its Win32 `WINDOWPLACEMENT` (`GetWindowPlacement`; showCmd 1=normal / 3=maximized + normal rect) to `hermes_geom.txt` (one line `<showCmd> <L> <T> <R> <B>`, next to the scripts, NOT in WORKDIR) after every work op, on `hide`, on `quit`. `show` and startup call `Restore-Geom`: `SetWindowPlacement` + `ShowWindow(showCmd)` — CRITICAL: on a HIDDEN window SetWindowPlacement alone sets the rect but neither shows nor maximizes; the paired ShowWindow(1|3) is mandatory. Saved rect is clamped back inside the virtual screen (monitor layout can change). Only with NO saved file the default top-left 1366x844 applies. Fact-check: op `geom` / client `geom` → `PLACEMENT showCmd=N zoom=0|1 normal=L,T,R,B now=WxHpx @XxY`; logs `geom(show): restored ...`. Verified live: custom 100,100 800x600 and maximized (zoom=1, 1936x1056) both survive hide→show AND a full bridge restart.
+- Anti-zombie self-job (bridge): at startup, BEFORE the cmd child exists, the bridge assigns ITSELF to a kill-on-close Job Object (`CreateJobObject` + `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, class 9; membership is inherited by everything the console tree spawns). Root cause it fixes: killed/crashed bridges orphaned their cmd.exe and nested powershell, each keeping a zombie console window (45 orphan cmd + ~50 ConsoleWindowClass windows accumulated after the Oct-14 restart storm — user: «сейчас по факту два окна вместо одного»). Now any bridge death destroys the whole tree and its windows; tray relaunch is clean. Verified: killed bridge with a sleeping nested powershell → `NESTED-PS-SURVIVORS=0`, `NEW-ORPHANS=0`, tray relaunched in ~5 s. Additionally the bridge sweeps at startup: `CloseForeignHermesConsoles()` enumerates `ConsoleWindowClass` windows whose title contains HERMES-CONSOLE and posts WM_CLOSE to every one EXCEPT its own HWND (identity check — WM_CLOSE would bypass the SC_CLOSE lock); conhost takes the attached orphan down with it. Verified live: `closed 47 zombie windows`, orphan cmd 45→0, conhost 52→5, exactly 1 bridge after. Pitfall: SSH-side `EnumWindows` finds ZERO ConsoleWindowClass (session 0 vs 1) — run window diagnostics THROUGH the console (write results to a file, read back).
 - New-server deployment is ONE command: `bash scripts/install_server.sh` (reads the same
   console.cfg as console_up.sh). It checks SSH + EXPECT_HOST identity, creates/proves
   writability of PS1_DIR, copies scripts with LF→CRLF (BOM preserved), creates
@@ -132,6 +134,7 @@ Other fixed unique identifiers: scheduled task `HERMES-CONSOLE`, tray mutex `HER
   renames — run `bash -n` AND a live run, both paths (fresh + already-running).
   Verified live 2026-10-15 on both paths: fresh (down → install brought the whole stack
   up, `hb` → pong) and idempotent (already-running → files refreshed, stack untouched).
+- **TABS (tray v4.0, user: «предлагаю реализовать систему вкладок — строго в этом инструменте»):** a Windows console has exactly ONE input queue — while the bridge's cmd child runs a long-lived server (real case: START.bat → ComfyUI python.exe on :7777), `keys` goes into the SERVER's stdin, typing into that window is physically impossible without killing the server. A "tab" = a full separate bridge: own cmd child/window/process, own port `BASE+tab-1`, own history `hermes_history_tN.txt` and geometry `hermes_geom_tN.txt` (tab 1 keeps legacy names/port). Bridge takes `-Tab N -TabLabel L -WorkDir D`. Tray (session 1) owns tab lifecycle: supervises every tab in the worker (per-tab hb, aggregate icon state), menu **Tabs** (per-tab show/hide/restart/close) + **New tab...** (label + folder dialog); tab commands via seam `!addtab label|dir` / `!closetab N`; `!quit`/`!restart`/`!toggle` are tab-aware. console_up.sh forwards the WHOLE range (one -L per tab port); console_down.sh sends `quit` to every tab port so each saves its own history/geom. Zombie sweep at bridge start is TAG-AWARE: windows titled `HERMES-CONSOLE [Tn]` belonging to a live tab (answers hb) are NOT closed — without this, starting tab N would kill all other tabs. Verified live 2026-10-15: `tabs` → T1; `newtab "TEST" "E:\"` → after ~8 s `T2 port=18800 ... label=TEST`; `--tab 2 keys "echo TAB2-ALIVE"` executed in tab 2's window; `--tab 1 closetab 2` → `tabs` shows only T1.
 - Long-lived state (cd, env vars) persists in the child cmd.exe between calls; if the child dies, the bridge respawns it on the next `keys` op (state lost).
 - To close: run `scripts/console_down.sh` (quit op + tunnel drop, paired) or the user closes the window. Never leave the bridge listening after the task ends.
 

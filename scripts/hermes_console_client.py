@@ -32,7 +32,10 @@ def pick(name, default):
 HOST = pick("HOST", "127.0.0.1")      # where the bridge is REACHABLE from this machine.
                                       # NOTE: in console.cfg this is HC_HOST (plain HOST there
                                       # is the SSH target "user@host" — never a connect address).
-PORT = int(pick("PORT", "18799"))
+BASE_PORT = int(pick("PORT", "18799"))
+PORT = BASE_PORT                      # tab N speaks on BASE_PORT + N - 1
+MAX_TABS = int(pick("TABS", "8"))     # how many tab ports to probe for `tabs`
+TAB = 1
 REQ, RES, DONE = "HERMES-REQ-8F27:", "HERMES-RES-8F27:", "HERMES-DONE-8F27:"
 
 def request(obj, timeout=30):
@@ -67,6 +70,17 @@ if __name__ == "__main__":
                 print("bad --port:", argv[1]); sys.exit(2)
             if not 1 <= PORT <= 65535:
                 print("bad --port:", argv[1]); sys.exit(2)
+            BASE_PORT = PORT
+            argv = argv[2:]
+        elif argv[0] == "--tab" and len(argv) > 2:
+            # tab addressing: `--tab 2 keys "..."` -> port BASE_PORT + 1
+            try:
+                TAB = int(argv[1])
+            except ValueError:
+                print("bad --tab:", argv[1]); sys.exit(2)
+            if not 1 <= TAB <= 32:
+                print("bad --tab (1..32):", argv[1]); sys.exit(2)
+            PORT = BASE_PORT + TAB - 1
             argv = argv[2:]
         else:
             print("unknown flag:", argv[0]); sys.exit(2)
@@ -125,7 +139,48 @@ if __name__ == "__main__":
         run({"op": "keys", "text": text}, timeout=15)
     elif cmd == "quit":
         run({"op": "quit"})
+    elif cmd == "tabs":
+        # probe the whole tab port range through the SAME endpoint: a tab that answers hb is open.
+        # (The tray keeps its own table; the client stays stateless — no shared registry to corrupt.)
+        rows = []
+        for t in range(1, MAX_TABS + 1):
+            PORT = BASE_PORT + t - 1   # request() reads the module-level PORT: rebind BEFORE probing
+            try:
+                hb = request({"op": "hb"}, timeout=2)
+            except OSError:
+                hb = ""
+            if hb.startswith("pong"):
+                parts = hb.split()
+                ops = parts[2] if len(parts) > 2 else "?"
+                vis = parts[3] if len(parts) > 3 else "?"
+                try:
+                    ident = request({"op": "tab"}, timeout=2)
+                except OSError:
+                    ident = ""
+                label = ident.split("label=", 1)[1].strip() if "label=" in ident else ""
+                rows.append("T%d\tport=%d\t%s\tops=%s\t%s" % (t, PORT, vis, ops, ("label=" + label) if label else ""))
+        if not rows:
+            print("no tabs answering on ports %d..%d" % (BASE_PORT, BASE_PORT + MAX_TABS - 1))
+        else:
+            print("\n".join(rows))
+    elif cmd == "newtab":
+        # ask the TRAY (through the bridge's seam) to open a new console in the desktop session.
+        # usage: newtab ["label"] ["folder"]
+        obj = {"op": "newtab"}
+        if len(argv) > 1:
+            obj["label"] = argv[1]
+        if len(argv) > 2:
+            obj["workdir"] = argv[2]
+        run(obj, timeout=15)
+    elif cmd == "closetab":
+        need(1, "closetab N")
+        try:
+            n = int(argv[1])
+        except ValueError:
+            print("closetab: N must be a number"); sys.exit(2)
+        run({"op": "closetab", "tab": n}, timeout=15)
     else:
         print("unknown command:", cmd)
         print("commands: ping hb state screen history [lines] keys \"text\" show hide sysmenu quit")
+        print("          tabs  newtab [label] [folder]  closetab N   (global: --host H --port P --tab N)")
         sys.exit(2)

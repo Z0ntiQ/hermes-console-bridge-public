@@ -1,4 +1,8 @@
-﻿# hermes_tray.ps1 v3.3: non-blocking UI + endpoint menu + balloon feedback + default-folder menu
+﻿# hermes_tray.ps1 v4.0: TABS (several consoles, one bridge per tab) + non-blocking UI + endpoint
+# menu + balloon feedback + per-tab and default folder.
+# A tab = a separate HERMES-CONSOLE window/process/port (base + tab - 1). One console has exactly
+# ONE input queue, so a tab busy with a long-lived server (START.bat -> ComfyUI) cannot accept other
+# input; separate consoles are the only way to have several live, independently driven terminals.
 # A noticeable icon in the notification area (near the clock) supervising the HERMES-CONSOLE bridge.
 #   left double-click = show/hide console
 #   right-click menu  = Show / Hide / Restart bridge / Endpoint (auto-detect on this PC,
@@ -36,6 +40,8 @@ function CfgVal($name, $default) {
 $bridgeBind = [string] (CfgVal 'BRIDGE_BIND' '127.0.0.1')   # address the bridge listens on (server-side)
 $bridgePort = [int] (CfgVal 'PORT' 18799)
 $workDir0 = [string] (CfgVal 'WORKDIR' 'E:\AI')             # console default folder (shown in tooltip, editable in menu)
+$maxTabs = [int] (CfgVal 'TABS' 8)                          # tab N listens on PORT + N - 1
+if ($maxTabs -lt 1 -or $maxTabs -gt 32) { $maxTabs = 8 }
 $bridgeScript = Join-Path $here 'hermes_bridge.ps1'
 $tlog = Join-Path $here 'hermes_tray.log'
 # hygiene: cap log growth — rotate once at startup (tray restarts are rare), keep .old for triage
@@ -54,12 +60,13 @@ $status['uiBeat'] = $null      # last UI timer tick — used to MEASURE UI-threa
 $status['endpoint'] = ($bridgeBind + ':' + $bridgePort)   # live "addr:port" the tray talks to (menu shows it)
 $status['detect'] = 'idle'     # idle | scanning | found | none | manual  (endpoint auto-detect feedback)
 $status['workdir'] = $workDir0 # console default folder (tooltip + 'Set default folder...' menu)
+$status['tablist'] = @()      # snapshot of tabs for the menu: {tab,port,label,workdir,state,visible,ops}
 $cmds = New-Object 'System.Collections.Concurrent.ConcurrentQueue[string]'
 $stop = New-Object System.Threading.ManualResetEventSlim($false)
 
 # ============================ worker runspace: all networking lives here ============================
 $workerBody = {
-  param($tlog, $bridgeScript, $bridgeBind, $bridgePort, $cfgFile, $status, $cmds, $stop)
+  param($tlog, $bridgeScript, $bridgeBind, $bridgePort, $cfgFile, $status, $cmds, $stop, $maxTabs)
   # Protocol v2 (must match hermes_bridge.ps1 exactly)
   $REQ = 'HERMES-REQ-8F27:'; $RES = 'HERMES-RES-8F27:'; $DONE = 'HERMES-DONE-8F27:'
   function WLog($m) { Add-Content -Path $tlog -Value ((Get-Date -Format 'HH:mm:ss') + ' [w] ' + $m) -ErrorAction SilentlyContinue }
@@ -176,27 +183,89 @@ $workerBody = {
     return , $cands
   }
 
-  $bridgeProc = $null
-  $lastLaunch = $null
-  $fails = 0
+  $workDirDefault = [string] $status['workdir']   # worker-local copy; '!setwd' updates it
+  # ---- TABS: one bridge process per tab, tab N on port base+N-1 ----
+  $tabs = @{}   # tab id -> hashtable(tab, port, label, workdir, proc, lastLaunch, fails, state, visible, ops)
+  function New-TabState([int] $t, [string] $label, [string] $wd) {
+    $h = @{ tab = $t; port = ($bridgePort + $t - 1); label = $label; workdir = $wd
+            proc = $null; lastLaunch = $null; fails = 0; state = 'down'; visible = $false; ops = -1 }
+    $tabs[$t] = $h
+    return $h
+  }
+  function Launch-Tab($h) {
+    $a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $bridgeScript, '-Tab', ([string] $h['tab']))
+    if ($h['label'])   { $a += @('-TabLabel', $h['label']) }
+    if ($h['workdir']) { $a += @('-WorkDir',  $h['workdir']) }
+    $h['lastLaunch'] = Get-Date
+    $h['proc'] = Start-Process -FilePath 'powershell.exe' -ArgumentList $a -WindowStyle Hidden -PassThru
+    WLog ('tab ' + $h['tab'] + ': launched pid=' + $h['proc'].Id + ' port=' + $h['port'] + ' wd=' + $h['workdir'])
+  }
+  function Publish-Tabs {
+    $arr = @()
+    foreach ($k in ($tabs.Keys | Sort-Object)) {
+      $h = $tabs[$k]
+      $arr += [pscustomobject]@{ tab = $h['tab']; port = $h['port']; label = $h['label']; workdir = $h['workdir']
+                                 state = $h['state']; visible = $h['visible']; ops = $h['ops'] }
+    }
+    $status['tablist'] = $arr
+  }
+  function Free-TabId {
+    for ($t = 1; $t -le $maxTabs; $t++) { if (-not $tabs.ContainsKey($t)) { return $t } }
+    return 0
+  }
+  function Close-Tab([int] $t, [string] $why) {
+    if (-not $tabs.ContainsKey($t)) { return ('tab ' + $t + ' is not open') }
+    $h = $tabs[$t]
+    [void] (Invoke-BridgeAt (Get-Endpoint)[0] $h['port'] '{"op":"quit"}' 1500)
+    if ($h['proc'] -and -not $h['proc'].HasExited) { Stop-Process -Id $h['proc'].Id -Force -ErrorAction SilentlyContinue }
+    $tabs.Remove($t) | Out-Null
+    Publish-Tabs
+    WLog ('tab ' + $t + ': closed (' + $why + ')')
+    return ('tab ' + $t + ' closed')
+  }
   $wdPoll = 0   # counter for periodic 'wd' fetches (tooltip/menu folder stays honest)
   # optional manual seam: write a line "!file <cmd>" into tray_cmd.txt (same folder) to enqueue
   # a menu command from outside the UI — same handlers, same queue. ("!detect", "!setep h p", ...)
   $cmdFile = (Split-Path -Parent $tlog) + '\tray_cmd.txt'
   WLog 'worker: start'
+  # Adopt tabs that are ALREADY answering (a tray restart must not orphan running consoles,
+  # and a bridge started by hand must appear in the menu without a restart).
+  $ep0 = Get-Endpoint
+  for ($t = 1; $t -le $maxTabs; $t++) {
+    $probe = Invoke-BridgeAt $ep0[0] ($bridgePort + $t - 1) '{"op":"hb"}' 700
+    if ($null -ne $probe -and $probe.Count -ge 1 -and $probe[0] -match '^pong ') {
+      $h = New-TabState $t '' $workDirDefault
+      $h['state'] = 'alive'
+      $tr = Invoke-BridgeAt $ep0[0] $h['port'] '{"op":"tab"}' 900
+      if ($null -ne $tr -and $tr.Count -ge 1 -and $tr[0] -match '^T\d+ port=\d+ label=(.*)$') { $h['label'] = $matches[1].Trim() }
+      $wr = Invoke-BridgeAt $ep0[0] $h['port'] '{"op":"wd"}' 900
+      if ($null -ne $wr -and $wr.Count -ge 1 -and $wr[0]) { $h['workdir'] = $wr[0].Trim() }
+      $p = $probe[0] -split ' '
+      if ($p.Count -ge 4) { $h['visible'] = ($p[3] -eq 'VISIBLE') }
+      WLog ('tab ' + $t + ': adopted live bridge on port ' + $h['port'])
+    }
+  }
+  if ($tabs.Count -eq 0) { [void] (New-TabState 1 '' $workDirDefault); Launch-Tab $tabs[1]; WLog 'worker: no tabs found, started tab 1' }
+  Publish-Tabs
   # NOTE: loop is while($true) ON PURPOSE: the queue must be drained even after $stop is set,
   # otherwise a queued '!quit' is skipped and the bridge is left orphaned when the tray exits.
   while ($true) {
     $immediate = $false   # set when a queued command changed things -> skip the poll sleep, react NOW
     try {
       if (Test-Path $cmdFile) {
-        $raw = $null
-        try { $raw = [System.IO.File]::ReadAllText($cmdFile) } catch { WLog ('cmd-file read failed: ' + $_.Exception.Message) }
-        try { Remove-Item $cmdFile -Force -ErrorAction SilentlyContinue } catch {}
+        # rename-then-read: the bridge APPENDS lines here (newtab/closetab), so a plain
+        # read-then-delete could swallow a line written between the two calls.
+        $qf = $cmdFile + '.q'
+        try { Move-Item -Force $cmdFile $qf -ErrorAction Stop } catch { WLog ('cmd-file rename failed: ' + $_.Exception.Message) }
+        try {
+          $raw = [System.IO.File]::ReadAllText($qf)
+          Remove-Item $qf -Force -ErrorAction SilentlyContinue
+        } catch { WLog ('cmd-file read failed: ' + $_.Exception.Message) }
         if ($raw) {
-          $cf = $raw.Trim() -replace '^!file\s+', ''
-          WLog ('cmd-file: [' + $cf + ']')
-          if ($cf) { $cmds.Enqueue($cf) }
+          foreach ($ln in ($raw -split "`r?`n")) {
+            $cf = $ln.Trim() -replace '^!file\s+', ''
+            if ($cf) { WLog ('cmd-file: [' + $cf + ']'); $cmds.Enqueue($cf) }
+          }
         } else { WLog 'cmd-file: present but read returned nothing' }
       }
     } catch { WLog ('cmd-file error: ' + $_.Exception.Message) }
@@ -204,25 +273,74 @@ $workerBody = {
     $j = $null
     while ($cmds.TryDequeue([ref] $j)) {
       if ($j -eq '!quit') {
-        [void] (Invoke-Bridge '{"op":"quit"}' 1500)
-        if ($bridgeProc -and -not $bridgeProc.HasExited) { Stop-Process -Id $bridgeProc.Id -Force -ErrorAction SilentlyContinue }
+        # quit EVERY tab: each bridge saves its own history/geometry on quit, then we make sure
+        # the process is gone (a bridge that does not answer must not leave a zombie window).
+        foreach ($t in @($tabs.Keys)) { [void] (Close-Tab $t 'quit all') }
         $status['quitui'] = $true   # the paint timer will close the UI too (seam '!quit' must not leave a zombie icon)
         $stop.Set(); break
       }
-      if ($j -eq '!toggle') { if ($status['visible']) { $j = '{"op":"hide"}' } else { $j = '{"op":"show"}' } }
-      if ($j -eq '!restart') {
-        [void] (Invoke-Bridge '{"op":"quit"}' 1500)
-        if ($bridgeProc -and -not $bridgeProc.HasExited) { Stop-Process -Id $bridgeProc.Id -Force -ErrorAction SilentlyContinue }
-        $bridgeProc = $null; $lastLaunch = $null; $fails = 0
+      if ($j -eq '!toggle') {
+        # icon double-click: one gesture for the whole set - show every hidden tab, or hide all
+        $anyVisible = $false
+        foreach ($t in $tabs.Keys) { if ($tabs[$t]['visible']) { $anyVisible = $true } }
+        $j = if ($anyVisible) { '!hideall' } else { '!showall' }
+      }
+      if ($j -in @('!showall','!hideall')) {
+        $opName = if ($j -eq '!showall') { 'show' } else { 'hide' }
+        foreach ($t in @($tabs.Keys)) { [void] (Invoke-BridgeAt (Get-Endpoint)[0] $tabs[$t]['port'] ('{"op":"' + $opName + '"}') 2000) }
+        WLog ('worker: ' + $opName + ' applied to ' + $tabs.Count + ' tab(s)')
+      } elseif ($j -eq '!restart') {
+        foreach ($t in @($tabs.Keys)) {
+          $h = $tabs[$t]
+          [void] (Invoke-BridgeAt (Get-Endpoint)[0] $h['port'] '{"op":"quit"}' 1500)
+          if ($h['proc'] -and -not $h['proc'].HasExited) { Stop-Process -Id $h['proc'].Id -Force -ErrorAction SilentlyContinue }
+          $h['proc'] = $null; $h['lastLaunch'] = $null; $h['fails'] = 0; $h['state'] = 'down'
+        }
         Start-Sleep -Milliseconds 600
         # launch right here — waiting for supervision would cost 4 failed polls first (~3 s)
-        try {
-          $lastLaunch = Get-Date
-          $bridgeProc = Start-Process -FilePath 'powershell.exe' `
-            -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $bridgeScript `
-            -WindowStyle Hidden -PassThru
-          WLog ('worker: restart requested from menu, bridge relaunched pid=' + $bridgeProc.Id)
-        } catch { WLog ('worker: restart launch failed: ' + $_.Exception.Message) }
+        foreach ($t in @($tabs.Keys)) {
+          try { Launch-Tab $tabs[$t] } catch { WLog ('worker: restart launch failed tab ' + $t + ': ' + $_.Exception.Message) }
+        }
+        Publish-Tabs
+      } elseif ($j -match '^!addtab (.*)$') {
+        # new tab: "label|workdir" (either part may be empty)
+        $spec = $matches[1]
+        $parts = $spec -split '\|', 2
+        $lbl = [string] $parts[0]
+        $wd = if ($parts.Count -gt 1) { [string] $parts[1] } else { '' }
+        $id = Free-TabId
+        if ($id -eq 0) {
+          $status['balloon'] = @('warning', 'HERMES: no free tab', ('All ' + $maxTabs + ' tabs are open - close one first (TABS=' + $maxTabs + ' in hermes_console.cfg).'))
+          WLog 'addtab: no free tab id'
+        } elseif ($wd -and (Test-Path -LiteralPath $wd -PathType Leaf)) {
+          $status['balloon'] = @('warning', 'HERMES: bad folder', ('This is a file, not a folder: ' + $wd + ' - tab not created.'))
+        } else {
+          $h = New-TabState $id $lbl $wd
+          try { Launch-Tab $h; Publish-Tabs
+            $status['balloon'] = @('info', 'HERMES: tab opened', ('Tab T' + $id + ' started on port ' + $h['port'] + ' in ' + ($wd -or $workDirDefault) + '. Open it from the tray menu (Tabs).'))
+          } catch { $tabs.Remove($id) | Out-Null; Publish-Tabs
+            $status['balloon'] = @('warning', 'HERMES: tab failed', ('Could not start tab T' + $id + ': ' + $_.Exception.Message)) }
+        }
+        $immediate = $true
+      } elseif ($j -match '^!closetab (\d+)$') {
+        $msg = Close-Tab ([int] $matches[1]) 'user request'
+        $status['balloon'] = @('info', 'HERMES: tab closed', $msg)
+        $immediate = $true
+      } elseif ($j -match '^!tabop (\S+) (\d+)$') {
+        # per-tab show/hide from the menu
+        $th = $tabs[[int] $matches[2]]
+        if ($th) { [void] (Invoke-BridgeAt (Get-Endpoint)[0] $th['port'] ('{"op":"' + $matches[1] + '"}') 2000) }
+      } elseif ($j -match '^!tabrestart (\d+)$') {
+        $th = $tabs[[int] $matches[1]]
+        if ($th) {
+          [void] (Invoke-BridgeAt (Get-Endpoint)[0] $th['port'] '{"op":"quit"}' 1500)
+          if ($th['proc'] -and -not $th['proc'].HasExited) { Stop-Process -Id $th['proc'].Id -Force -ErrorAction SilentlyContinue }
+          $th['proc'] = $null; $th['fails'] = 0; $th['state'] = 'down'
+          Start-Sleep -Milliseconds 400
+          try { Launch-Tab $th } catch { WLog ('tabrestart: launch failed: ' + $_.Exception.Message) }
+          Publish-Tabs
+        }
+        $immediate = $true
       } elseif ($j -eq '!detect') {
         # auto-detect: probe local endpoints that ANSWER the HERMES protocol.
         # Results reach the user as balloon tips (pick dialog when several answer) —
@@ -312,10 +430,24 @@ $workerBody = {
         } else {
           if (Upsert-CfgKey 'WORKDIR' $wd) {
             $status['workdir'] = $wd
+            # tabs that follow the DEFAULT folder move with it; a tab opened with its own explicit
+            # folder keeps that folder (that is the point of per-tab folders)
+            $moved = 0
+            foreach ($t in @($tabs.Keys)) {
+              if (-not $tabs[$t]['workdir'] -or $tabs[$t]['workdir'] -eq $workDirDefault) {
+                $tabs[$t]['workdir'] = ''; $moved++
+                [void] (Invoke-BridgeAt (Get-Endpoint)[0] $tabs[$t]['port'] '{"op":"quit"}' 1500)
+                if ($tabs[$t]['proc'] -and -not $tabs[$t]['proc'].HasExited) { Stop-Process -Id $tabs[$t]['proc'].Id -Force -ErrorAction SilentlyContinue }
+                $tabs[$t]['proc'] = $null; $tabs[$t]['fails'] = 0; $tabs[$t]['state'] = 'down'
+              }
+            }
+            $workDirDefault = $wd
+            Start-Sleep -Milliseconds 500
+            foreach ($t in @($tabs.Keys)) { if (-not $tabs[$t]['proc'] -or $tabs[$t]['proc'].HasExited) { try { Launch-Tab $tabs[$t] } catch { WLog ('setwd relaunch failed tab ' + $t) } } }
+            Publish-Tabs
             $status['balloon'] = @('info', 'HERMES: folder applied',
-              ('Default folder applied and saved: ' + $wd + ' - bridge restarted there.'))
-            WLog ('setwd: WORKDIR=' + $wd + ' - restarting bridge into it')
-            $cmds.Enqueue('!restart')
+              ('Default folder applied and saved: ' + $wd + ' - restarted ' + $moved + ' default-folder tab(s); tabs with their own folder untouched.'))
+            WLog ('setwd: WORKDIR=' + $wd + ' - restarted ' + $moved + ' tab(s) into it')
             $immediate = $true
           } else {
             $status['balloon'] = @('warning', 'HERMES: save failed', ('Could not write WORKDIR into ' + $cfgFile + ' - nothing changed.'))
@@ -343,59 +475,70 @@ $workerBody = {
     }
     if ($stop.IsSet) { break }
 
-    # 2) heartbeat: liveness + activity + visibility in ONE round trip ("pong <secs> <ops> <VIS>")
-    $r = Invoke-Bridge '{"op":"hb"}' 2500
-    if ($null -ne $r -and $r.Count -ge 1 -and $r[0] -match '^pong ') {
-      if ($fails -ge 2) { WLog ('worker: bridge back after ' + $fails + ' failed polls') }
-      $fails = 0
-      $status['state'] = 'alive'
-      $p = $r[0] -split ' '
-      if ($p.Count -ge 3) { $status['ops'] = [int] $p[2] }
-      if ($p.Count -ge 4) { $status['visible'] = ($p[3] -eq 'VISIBLE') }
-      # keep the folder shown in tooltip/menu honest: the BRIDGE knows where cmd.exe really
-      # started (a manual cfg edit or a bridge restart with another cfg must stay visible).
-      $wdPoll = $wdPoll + 1
-      if ($wdPoll -ge 15) {
-        $wdPoll = 0
-        $wr = Invoke-Bridge '{"op":"wd"}' 1500
-        if ($null -ne $wr -and $wr.Count -ge 1 -and $wr[0] -and $wr[0] -notlike 'ERR*') {
-          $status['workdir'] = $wr[0].Trim()
-        }
-      }
-    } else {
-      $fails++
-      if ($fails -ge 4) {
-        # only now do we call it dead: 4 consecutive failures ~= several seconds of silence
-        if ($bridgeProc -and -not $bridgeProc.HasExited) {
-          # honest status: process ALIVE but not answering = BUSY (long command / booting).
-          # NOT down: the icon must never lie. The bridge answers hb between ops.
-          $status['state'] = 'busy'
-          if ($fails % 10 -eq 4) { WLog ('worker: bridge busy (alive, silent ' + ($fails * 3) + 's) - not touching it') }
-        } else {
-          $status['state'] = 'down'
-          if (-not $lastLaunch -or ((Get-Date) - $lastLaunch).TotalSeconds -ge 30) {
-          # a dead bridge's orphan cmd.exe child may still own the port (inherited listen socket)
-          try {
-            Get-NetTCPConnection -LocalPort (Get-Endpoint)[1] -State Listen -ErrorAction SilentlyContinue |
-              ForEach-Object {
-                $pp = Get-CimInstance Win32_Process -Filter "ProcessId=$($_.OwningProcess)" -ErrorAction SilentlyContinue
-                if ($pp -and ($pp.Name -in @('powershell.exe', 'cmd.exe', 'conhost.exe'))) {
-                  Stop-Process -Id $pp.ProcessId -Force -ErrorAction SilentlyContinue
-                  WLog ('worker: killed stale port owner pid=' + $pp.ProcessId + ' name=' + $pp.Name)
-                }
-              }
-            Start-Sleep -Milliseconds 400
-          } catch {}
-          $lastLaunch = Get-Date
-          $bridgeProc = Start-Process -FilePath 'powershell.exe' `
-            -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $bridgeScript `
-            -WindowStyle Hidden -PassThru
-          WLog ('worker: bridge launched pid=' + $bridgeProc.Id)
-          $fails = 0
+    # 2) heartbeat EVERY tab: liveness + activity + visibility in ONE round trip each
+    #    ("pong <secs> <ops> <VISIBLE|HIDDEN>"). The icon shows the AGGREGATE: any tab working =
+    #    green blink, any tab alive = not red, all tabs silent-but-alive = yellow, all dead = red.
+    $epH = (Get-Endpoint)[0]
+    $anyAlive = $false; $anyBusy = $false; $opsSum = 0; $anyVisible = $false
+    $published = $false
+    foreach ($t in @($tabs.Keys)) {
+      $h = $tabs[$t]
+      $r = Invoke-BridgeAt $epH $h['port'] '{"op":"hb"}' 2500
+      if ($null -ne $r -and $r.Count -ge 1 -and $r[0] -match '^pong ') {
+        if ($h['fails'] -ge 2) { WLog ('tab ' + $t + ': back after ' + $h['fails'] + ' failed polls') }
+        $h['fails'] = 0; $h['state'] = 'alive'
+        $p = $r[0] -split ' '
+        if ($p.Count -ge 3) { $h['ops'] = [int] $p[2] }
+        if ($p.Count -ge 4) { $h['visible'] = ($p[3] -eq 'VISIBLE') }
+      } else {
+        $h['fails']++
+        if ($h['fails'] -ge 4) {
+          # only now do we call it dead: 4 consecutive failures ~= several seconds of silence
+          if ($h['proc'] -and -not $h['proc'].HasExited) {
+            # honest status: process ALIVE but not answering = BUSY (long command / booting).
+            # NOT down: the icon must never lie. The bridge answers hb between ops.
+            $h['state'] = 'busy'
+            if ($h['fails'] % 10 -eq 4) { WLog ('tab ' + $t + ': busy (alive, silent ' + ($h['fails'] * 3) + 's) - not touching it') }
+          } else {
+            $h['state'] = 'down'
+            if (-not $h['lastLaunch'] -or ((Get-Date) - $h['lastLaunch']).TotalSeconds -ge 30) {
+              # a dead bridge's orphan cmd.exe child may still own the port (inherited listen socket)
+              try {
+                Get-NetTCPConnection -LocalPort $h['port'] -State Listen -ErrorAction SilentlyContinue |
+                  ForEach-Object {
+                    $pp = Get-CimInstance Win32_Process -Filter "ProcessId=$($_.OwningProcess)" -ErrorAction SilentlyContinue
+                    if ($pp -and ($pp.Name -in @('powershell.exe', 'cmd.exe', 'conhost.exe'))) {
+                      Stop-Process -Id $pp.ProcessId -Force -ErrorAction SilentlyContinue
+                      WLog ('worker: killed stale port owner pid=' + $pp.ProcessId + ' name=' + $pp.Name)
+                    }
+                  }
+                Start-Sleep -Milliseconds 400
+              } catch {}
+              try { Launch-Tab $h; $published = $true } catch { WLog ('tab ' + $t + ': relaunch failed: ' + $_.Exception.Message) }
+              $h['fails'] = 0
+            }
           }
         }
       }
+      if ($h['state'] -eq 'alive') { $anyAlive = $true; $opsSum += [int] $h['ops']; if ($h['visible']) { $anyVisible = $true } }
+      elseif ($h['state'] -eq 'busy') { $anyBusy = $true }
     }
+    $status['state'] = if ($anyAlive) { 'alive' } elseif ($anyBusy) { 'busy' } else { 'down' }
+    $status['ops'] = $opsSum
+    $status['visible'] = $anyVisible
+    # keep the folder shown in tooltip/menu honest: the BRIDGE knows where cmd.exe really
+    # started (a manual cfg edit or a bridge restart with another cfg must stay visible).
+    $wdPoll = $wdPoll + 1
+    if ($wdPoll -ge 15 -and $tabs.Count -ge 1) {
+      $wdPoll = 0
+      $first = ($tabs.Keys | Sort-Object | Select-Object -First 1)
+      $wr = Invoke-BridgeAt $epH $tabs[$first]['port'] '{"op":"wd"}' 1500
+      if ($null -ne $wr -and $wr.Count -ge 1 -and $wr[0] -and $wr[0] -notlike 'ERR*') {
+        $tabs[$first]['workdir'] = $wr[0].Trim()
+        $status['workdir'] = $wr[0].Trim()
+      }
+    }
+    Publish-Tabs
 
     # 3) instrument the UI thread: if its paint timer stopped beating, the menu WILL feel frozen.
     #    This is how the old design was caught, and how the fix is verified by fact.
@@ -410,7 +553,7 @@ $workerBody = {
 }
 
 $worker = [PowerShell]::Create().AddScript($workerBody)
-foreach ($a in @($tlog, $bridgeScript, $bridgeBind, $bridgePort, $cfgFile, $status, $cmds, $stop)) { [void] $worker.AddArgument($a) }
+foreach ($a in @($tlog, $bridgeScript, $bridgeBind, $bridgePort, $cfgFile, $status, $cmds, $stop, $maxTabs)) { [void] $worker.AddArgument($a) }
 [void] $worker.BeginInvoke()
 
 # ================================ UI thread: icon + menu + paint ================================
@@ -452,10 +595,15 @@ $menu = New-Object System.Windows.Forms.ContextMenuStrip
 # console: hidden» and the found-hint line too). The menu is ACTIONS only; state lives in the
 # icon color + tooltip, detect results arrive as balloon tips, results of auto-detect never
 # sit in the menu.
-$miShow = $menu.Items.Add('Show console')
-$miHide = $menu.Items.Add('Hide console')
+$miShow = $menu.Items.Add('Show all consoles')
+$miHide = $menu.Items.Add('Hide all consoles')
+# ---- Tabs submenu: rebuilt on every open from the worker's tab table (status['tablist']) ----
+$miTabs = New-Object System.Windows.Forms.ToolStripMenuItem
+$miTabs.Text = 'Tabs'
+[void] $menu.Items.Add($miTabs)
+$miAddTab = $menu.Items.Add('New tab...')
 [void] $menu.Items.Add('-')
-$miRestart = $menu.Items.Add('Restart bridge')
+$miRestart = $menu.Items.Add('Restart all bridges')
 # ---- Endpoint section: where this tray talks to the bridge (host:port) ----
 [void] $menu.Items.Add('-')
 $miEpLabel = $menu.Items.Add('Endpoint: -')
@@ -473,6 +621,33 @@ $ni.ContextMenuStrip = $menu
 
 # Refresh the endpoint label each time the menu opens — reads the shared cache only, no I/O.
 $menu.Add_Opening({
+  # ---- rebuild the Tabs submenu from the worker's snapshot (cache read only, no sockets) ----
+  $script:miTabs.DropDownItems.Clear()
+  $tl = @($script:status['tablist'])
+  foreach ($t in $tl) {
+    $mark = if ($t.visible) { '[open]  ' } elseif ($t.state -eq 'alive') { '[hidden]' } else { '[' + $t.state.ToUpper() + ']' }
+    $name = 'T' + $t.tab
+    if ($t.label) { $name += ' - ' + $t.label }
+    $item = New-Object System.Windows.Forms.ToolStripMenuItem
+    $item.Text = ($mark + ' ' + $name + '  :' + $t.port)
+    $ti = $t.tab
+    if ($t.visible) { $item.Add_Click({ $script:cmds.Enqueue(('!tabop hide ' + $ti)) }.GetNewClosure()) }
+    else { $item.Add_Click({ $script:cmds.Enqueue(('!tabop show ' + $ti)) }.GetNewClosure()) }
+    [void] $script:miTabs.DropDownItems.Add($item)
+    $subShow = New-Object System.Windows.Forms.ToolStripMenuItem; $subShow.Text = 'Show'
+    $subShow.Add_Click({ $script:cmds.Enqueue(('!tabop show ' + $ti)) }.GetNewClosure())
+    $subHide = New-Object System.Windows.Forms.ToolStripMenuItem; $subHide.Text = 'Hide'
+    $subHide.Add_Click({ $script:cmds.Enqueue(('!tabop hide ' + $ti)) }.GetNewClosure())
+    $subRestart = New-Object System.Windows.Forms.ToolStripMenuItem; $subRestart.Text = 'Restart'
+    $subRestart.Add_Click({ $script:cmds.Enqueue(('!tabrestart ' + $ti)) }.GetNewClosure())
+    $subClose = New-Object System.Windows.Forms.ToolStripMenuItem; $subClose.Text = 'Close tab'
+    $subClose.Add_Click({ $script:cmds.Enqueue(('!closetab ' + $ti)) }.GetNewClosure())
+    [void] $item.DropDownItems.AddRange(@($subShow, $subHide, $subRestart, $subClose))
+  }
+  if ($tl.Count -eq 0) {
+    $none = New-Object System.Windows.Forms.ToolStripMenuItem; $none.Text = '(no tabs)'; $none.Enabled = $false
+    [void] $script:miTabs.DropDownItems.Add($none)
+  }
   $script:miEpLabel.Text = 'Endpoint: ' + [string] $script:status['endpoint']
   $wdTxt = [string] $script:status['workdir']
   # tooltip/menu text has a hard cap in Windows; trim long paths from the middle, keep the tail
@@ -544,11 +719,47 @@ function Show-PickDialog($items, $curEp) {
   return $sel
 }
 
+# New-tab dialog: an optional label and an optional folder. Cancel = nothing happens.
+# The folder box is prefilled with the DEFAULT folder; clearing it means 'use whatever the
+# bridge cfg says'. The worker validates and launches; failures come back as a balloon.
+function Show-NewTabDialog {
+  $frm = New-Object System.Windows.Forms.Form
+  $frm.Text = 'HERMES - new console tab'
+  $frm.FormBorderStyle = 'FixedDialog'; $frm.MaximizeBox = $false; $frm.MinimizeBox = $false
+  $frm.ShowInTaskbar = $false; $frm.TopMost = $true
+  $frm.ClientSize = New-Object System.Drawing.Size(420, 150)
+  $l1 = New-Object System.Windows.Forms.Label; $l1.Text = 'Label (optional):'; $l1.Location = New-Object System.Drawing.Point(12, 14); $l1.AutoSize = $true
+  $tbL = New-Object System.Windows.Forms.TextBox; $tbL.Location = New-Object System.Drawing.Point(120, 11); $tbL.Width = 285
+  $l2 = New-Object System.Windows.Forms.Label; $l2.Text = 'Folder:'; $l2.Location = New-Object System.Drawing.Point(12, 44); $l2.AutoSize = $true
+  $tbW = New-Object System.Windows.Forms.TextBox; $tbW.Text = [string] $script:status['workdir']; $tbW.Location = New-Object System.Drawing.Point(120, 41); $tbW.Width = 245
+  $btnW = New-Object System.Windows.Forms.Button; $btnW.Text = '...'; $btnW.Location = New-Object System.Drawing.Point(370, 40); $btnW.Width = 35
+  $btnW.Add_Click({
+    $fb = New-Object System.Windows.Forms.FolderBrowserDialog
+    if (Test-Path -LiteralPath $tbW.Text -PathType Container) { $fb.SelectedPath = $tbW.Text }
+    if ($fb.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK -and $fb.SelectedPath) { $tbW.Text = $fb.SelectedPath }
+    $fb.Dispose()
+  })
+  $ok = New-Object System.Windows.Forms.Button; $ok.Text = 'Open tab'; $ok.Location = New-Object System.Drawing.Point(120, 92); $ok.Width = 110; $ok.DialogResult = [System.Windows.Forms.DialogResult]::OK
+  $cancel = New-Object System.Windows.Forms.Button; $cancel.Text = 'Cancel'; $cancel.Location = New-Object System.Drawing.Point(240, 92); $cancel.Width = 110; $cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+  $frm.Controls.AddRange(@($l1, $tbL, $l2, $tbW, $btnW, $ok, $cancel))
+  $frm.AcceptButton = $ok; $frm.CancelButton = $cancel
+  $res = $frm.ShowDialog()
+  $lbl = $tbL.Text.Trim(); $wd = $tbW.Text.Trim()
+  $frm.Dispose()
+  if ($res -ne [System.Windows.Forms.DialogResult]::OK) { return $null }
+  if ($lbl -match '[|\r\n]') { [void] [System.Windows.Forms.MessageBox]::Show('Label must not contain | or newlines.', 'HERMES', 'OK', 'Warning'); return $null }
+  return ($lbl + '|' + $wd)
+}
+
 # Every handler only ENQUEUES — no sockets, no Sleep, so the menu closes instantly and the
 # worker performs the action right after its current poll.
-$miShow.Add_Click({ $script:cmds.Enqueue('{"op":"show"}') })
-$miHide.Add_Click({ $script:cmds.Enqueue('{"op":"hide"}') })
+$miShow.Add_Click({ $script:cmds.Enqueue('!showall') })
+$miHide.Add_Click({ $script:cmds.Enqueue('!hideall') })
 $miRestart.Add_Click({ $script:cmds.Enqueue('!restart') })
+$miAddTab.Add_Click({
+  $spec = Show-NewTabDialog
+  if ($null -ne $spec) { $script:cmds.Enqueue(('!addtab ' + $spec)) }
+})
 $miEpAuto.Add_Click({ $script:cmds.Enqueue('!detect') })
 $miEpManual.Add_Click({
   $spec = Show-EndpointDialog
@@ -638,6 +849,11 @@ $timer.Add_Tick({
       'green'  { 'HERMES-CONSOLE - agent WORKING' }
       default  { 'HERMES-CONSOLE - ready (idle)' }
     }) + ' @ ' + $epNow + ' | ' + $wdNow
+    $tl2 = @($script:status['tablist'])
+    if ($tl2.Count -gt 0) {
+      $vis = 0; foreach ($t in $tl2) { if ($t.visible) { $vis++ } }
+      $script:ni.Text += ' | tabs: ' + $tl2.Count + ' (' + $vis + ' shown)'
+    }
     $script:lastState = $state
     $script:lastEp = $epNow
     $script:lastWd = $wdNow
