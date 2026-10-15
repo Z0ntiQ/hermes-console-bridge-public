@@ -1,0 +1,13 @@
+# hermes_console.cfg — copy next to hermes_bridge.ps1 / hermes_tray.ps1 on the SERVER
+# (same folder) to override defaults. All keys optional; env HERMES_* wins over this file.
+#
+# BIND=127.0.0.1   address the bridge LISTENS on. Keep loopback unless you have a reason;
+#                  any local address is allowed (e.g. a Tailscale IP when the tunnel is
+#                  realized differently and does not land on loopback).
+# PORT=18799       TCP port (bridge listens here; the tray connects here too).
+# WORKDIR=E:\AI    working directory of the visible console.
+# BRIDGE_BIND=     optional: address the TRAY uses to reach the bridge (default = BIND).
+
+BIND=127.0.0.1
+PORT=18799
+WORKDIR=E:\AI

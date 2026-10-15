@@ -1,0 +1,3 @@
+# real, host-specific configs stay local — only *.example goes to the repo
+console.cfg
+hermes_console.cfg

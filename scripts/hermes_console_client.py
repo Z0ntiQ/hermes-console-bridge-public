@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+"""Client for the HERMES-CONSOLE bridge (default: via SSH tunnel 127.0.0.1:18799).
+
+Endpoint is configurable — for a different tunnel realization (cloudflared, Tailscale
+serve, socat, an existing remote port, etc.) point the client at it:
+  env:       HC_HOST=100.x.y.z HC_PORT=18799 python3 hermes_console_client.py ...
+  flags:     python3 hermes_console_client.py --host 100.x.y.z --port 18799 screen
+  config:    scripts/console.cfg (KEY=VALUE, same file console_up.sh reads)
+
+Protocol v2 — unique line prefixes, never confused with stray traffic:
+  request : HERMES-REQ-8F27:<json>
+  payload : HERMES-RES-8F27:<line>   (repeated)
+  end     : HERMES-DONE-8F27:<op>
+"""
+import json, os, socket, sys
+
+def load_cfg():
+    """KEY=VALUE from scripts/console.cfg (next to this file), if present."""
+    cfg = {}
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "console.cfg")
+    if os.path.exists(p):
+        for line in open(p, encoding="utf-8", errors="replace"):
+            if "=" in line and not line.strip().startswith("#"):
+                k, v = line.split("=", 1)
+                cfg[k.strip().upper()] = v.strip()
+    return cfg
+
+def pick(name, default):
+    # priority: env > console.cfg > default
+    return os.environ.get("HC_" + name) or load_cfg().get("HC_" + name) or default
+
+HOST = pick("HOST", "127.0.0.1")      # where the bridge is REACHABLE from this machine.
+                                      # NOTE: in console.cfg this is HC_HOST (plain HOST there
+                                      # is the SSH target "user@host" — never a connect address).
+PORT = int(pick("PORT", "18799"))
+REQ, RES, DONE = "HERMES-REQ-8F27:", "HERMES-RES-8F27:", "HERMES-DONE-8F27:"
+
+def request(obj, timeout=30):
+    s = socket.create_connection((HOST, PORT), timeout=timeout)
+    s.settimeout(timeout)
+    f = s.makefile("rwb")
+    f.write((REQ + json.dumps(obj, ensure_ascii=True) + "\n").encode())
+    f.flush()
+    out = []
+    while True:
+        line = f.readline()
+        if not line:
+            break
+        line = line.decode("utf-8", "replace").rstrip("\r\n")
+        if line.startswith(DONE):
+            break
+        if line.startswith(RES):
+            out.append(line[len(RES):])
+    s.close()
+    return "\n".join(out)
+
+if __name__ == "__main__":
+    argv = sys.argv[1:]
+    # global flags before the command: --host H --port P
+    while argv and argv[0].startswith("--"):
+        if argv[0] == "--host" and len(argv) > 2:
+            HOST, argv = argv[1], argv[2:]
+        elif argv[0] == "--port" and len(argv) > 2:
+            try:
+                PORT = int(argv[1])
+            except ValueError:
+                print("bad --port:", argv[1]); sys.exit(2)
+            if not 1 <= PORT <= 65535:
+                print("bad --port:", argv[1]); sys.exit(2)
+            argv = argv[2:]
+        else:
+            print("unknown flag:", argv[0]); sys.exit(2)
+    cmd = argv[0] if argv else "screen"
+
+    def need(n, what):
+        if len(argv) <= n:
+            print("usage: hermes_console_client.py %s %s" % (cmd, what))
+            sys.exit(2)
+
+    def run(obj, timeout=30):
+        # one clean error line instead of a socket traceback — the agent parses stdout
+        try:
+            print(request(obj, timeout=timeout))
+        except OSError as e:
+            print("ERROR: cannot reach bridge at %s:%s — %s" % (HOST, PORT, e))
+            print("(tunnel down? raise it: bash console_up.sh)")
+            sys.exit(1)
+
+    if cmd == "ping":
+        run({"op": "ping"})
+    elif cmd == "state":
+        run({"op": "state"})
+    elif cmd == "hb":
+        run({"op": "hb"}, timeout=10)
+    elif cmd == "screen":
+        run({"op": "screen"})
+    elif cmd == "history":
+        lines = 400
+        if len(argv) > 1:
+            try:
+                lines = max(1, min(9999, int(argv[1])))
+            except ValueError:
+                print("history: LINES must be a number"); sys.exit(2)
+        run({"op": "history", "lines": lines})
+    elif cmd == "show":
+        run({"op": "show"})
+    elif cmd == "hide":
+        run({"op": "hide"})
+    elif cmd == "sysmenu":
+        run({"op": "sysmenu"}, timeout=10)
+    elif cmd == "keys":
+        # No sleep: the bridge injects and answers instantly. For long-running commands, poll
+        # `screen`/`history` afterwards — never make the bridge wait (rock-solid status matters).
+        # Enter is appended here: 'keys' means "type AND run". Without the trailing \r the text
+        # only sits on the input line (this regression made every marker check a false positive —
+        # grep matched the typed command, not its output).
+        need(1, "keys \"text to type\"")
+        text = argv[1]
+        if not text.endswith("\r"):
+            text += "\r"
+        run({"op": "keys", "text": text}, timeout=15)
+    elif cmd == "quit":
+        run({"op": "quit"})
+    else:
+        print("unknown command:", cmd)
+        print("commands: ping hb state screen history [lines] keys \"text\" show hide sysmenu quit")
+        sys.exit(2)

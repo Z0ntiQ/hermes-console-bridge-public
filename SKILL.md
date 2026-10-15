@@ -1,0 +1,158 @@
+---
+name: hermes-console-bridge
+description: "Use when driving the Windows server visibly, no background."
+version: 1.0.0
+author: alexandrcherenkov
+license: MIT
+metadata:
+  hermes:
+    tags: [windows, ssh, console, interactive, tailscale]
+    related_skills: [windows-ssh, corrallama-model-switch]
+---
+
+# HERMES-CONSOLE Bridge (visible interactive console on the Windows server)
+
+## When to Use
+
+The user asks for interactive/visual work on their Windows server — opening programs, driving a console, anything they must watch on the server's monitor. Also when a task needs persistent interactive shell state on the server.
+
+Standing rule from the user: interactive work on the Windows server must be **strictly visual** — a real console window on the server's desktop that the user can watch — with **only Hermes** driving it, and **no background/hidden session modes**. This skill is the approved method. Do NOT use psexec for this (see Pitfalls).
+
+## Connection sequence (MANDATORY — tunnel and bridge are ONE unit)
+
+The SSH tunnel (`127.0.0.1:18799` on the Mac) and the bridge window (on the server) are **always used together, every single time**. Never drive the bridge without the tunnel; never raise the 18799 tunnel outside this skill.
+
+**Every use of this skill starts with the up-script (idempotent):**
+```bash
+bash ~/.hermes/skills/hermes-console-bridge/scripts/console_up.sh
+```
+Order it enforces: SSH check (route/Tailscale diagnostics on failure) → bridge window (launches the visible scheduled task only if not already listening) → SSH tunnel (re-raises only if stale) → end-to-end `ping`. Exit 0 + `HERMES-CONSOLE ready` = drive it. Do not hand-run the steps below unless this script fails.
+
+**Config (since 2026-10-15): host/port are no longer hardcoded.** `scripts/console.cfg` (git-ignored; `console.cfg.example` in the repo) holds `HOST` (SSH target), `KEY`, `PORT`, `TUNNEL=ssh|none`, `HC_HOST` (bridge connect address from this machine), `EXPECT_HOST` (identity check; empty = skip), `PS1_DIR`. Env `HC_*` overrides the file. **`TUNNEL=none`** = the tunnel is realized some other way (cloudflared, Tailscale serve, socat, open port): up/down then skip ssh -L entirely and just verify `HC_HOST:PORT`. Server side: `hermes_console.cfg.example` next to the .ps1s → `BIND` (listen address, default loopback), `PORT`, `WORKDIR`, `BRIDGE_BIND` (tray's connect address); env `HERMES_BIND/HERMES_PORT/HERMES_WORKDIR` wins. Client: `--host/--port` flags or `HC_HOST/HC_PORT`. PS scripts also resolve paths relative to their own folder (`$here`) — deployable to any server folder, not just `E:\LOCAL_HERMES`. Pitfall: in console.cfg, plain `HOST` is the SSH target (`user@addr`) — the client connect address is `HC_HOST`; never pass plain HOST to the client.
+
+**Paired teardown (both halves die together):**
+```bash
+bash ~/.hermes/skills/hermes-console-bridge/scripts/console_down.sh
+```
+Sends `quit` (closes the window + bridge on the server) and drops the local tunnel.
+
+## Architecture
+
+```
+Mac (hermes_console_client.py)
+  ── SSH tunnel ──▶ 127.0.0.1:18799 on server
+                       │
+             hermes_bridge.ps1 (PowerShell, owns the visible window)
+                       ├─ WriteConsoleInput  → injects real keystrokes into child cmd.exe
+                       ├─ ReadConsoleOutput  → reads the window's screen buffer
+                       └─ child cmd.exe — every typed char is visible on the server monitor
+```
+
+- Window title: `HERMES-CONSOLE`, size 120x40 (`mode con:` in the bat).
+- **Starts MINIMIZED to the taskbar (user's rule, 2026-10-14): the window is NOT open by default.** The bridge self-minimizes right after binding the port (`ShowWindow SW_SHOWMINIMIZED`). The user restores it from the taskbar whenever they want to watch; they can also minimize/restore mid-session. Driving works in either state (WriteConsoleInput/ReadConsoleOutput need no visible window). Query state with the `state` op → `MINIMIZED` / `RESTORED`.
+- **Default CWD: `E:\AI`** — standing rule: Hermes' own tests/scratch on the server live in `E:\AI`, and the console opens there by default (bat `cd /d E:\AI` + bridge `Set-Location` + child cmd.exe `-WorkingDirectory`). Do not put test artifacts elsewhere; `E:\LOCAL_HERMES` stays for deployables only.
+- Bridge listens on **127.0.0.1:18799 only** — reachable solely via SSH tunnel.
+- No foreground focus needed (WriteConsoleInput writes to the console input buffer directly).
+- The task is `schtasks /IT` (interactive-only, session 1). It lives only while the window is open — there is no background variant by design.
+
+## Files
+
+| Where | Path |
+|---|---|
+| Server (deployed) | `E:\LOCAL_HERMES\hermes_bridge.ps1`, `E:\LOCAL_HERMES\hermes_console.bat` |
+| Mac (client) | `~/MyAiWorkspace/tools/hermes_console_client.py` |
+| Skill copies (source of truth for redeploy) | `scripts/hermes_bridge.ps1`, `scripts/hermes_console.bat`, `scripts/hermes_console_client.py`, `scripts/console_up.sh`, `scripts/console_down.sh` |
+
+## Deploy (if files are missing on the server)
+
+1. Copy the skill's `scripts/hermes_bridge.ps1` and `scripts/hermes_console.bat` (via `skill_view(name='hermes-console-bridge', file_path='scripts/...')` if not on disk).
+2. CRLF-convert and scp (see `windows-ssh` skill for the pattern):
+   ```bash
+   sed 's/$/\r/' hermes_bridge.ps1 > /tmp/hb_crlf.ps1
+   sed 's/$/\r/' hermes_console.bat > /tmp/hc_crlf.bat
+   scp -i ~/.ssh/id_ed25519 -o BatchMode=yes /tmp/hb_crlf.ps1 user@192.168.1.10:E:/LOCAL_HERMES/hermes_bridge.ps1
+   scp -i ~/.ssh/id_ed25519 -o BatchMode=yes /tmp/hc_crlf.bat  user@192.168.1.10:E:/LOCAL_HERMES/hermes_console.bat
+   ```
+
+## Manual fallback: start the window (only if console_up.sh fails)
+
+```bash
+WSSH="ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=20 user@192.168.1.10"
+$WSSH 'schtasks /create /tn HERMES-CONSOLE /tr "E:\LOCAL_HERMES\hermes_console.bat" /sc once /st 00:00 /it /f'
+$WSSH 'schtasks /run /tn HERMES-CONSOLE'
+sleep 6
+# verify listener:
+$WSSH 'powershell -ExecutionPolicy Bypass -Command "Get-NetTCPConnection -LocalPort 18799 -State Listen"'
+```
+
+## Manual fallback: tunnel + client commands
+
+The tunnel is normally raised by `console_up.sh` — raise it by hand only to repair that script:
+```bash
+# tunnel (idempotent: kill old first)
+pkill -f "18799:127.0.0.1:18799"
+ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o StrictHostKeyChecking=no -o ExitOnForwardFailure=yes -f -N -L 18799:127.0.0.1:18799 user@192.168.1.10
+lsof -nP -iTCP:18799 -sTCP:LISTEN   # verify
+```
+
+Client usage (canonical copy lives in this skill's `scripts/`; `~/MyAiWorkspace/tools/hermes_console_client.py` is a working mirror):
+```bash
+python3 hermes_console_client.py ping                 # -> pong
+python3 hermes_console_client.py screen               # full window screen text
+python3 hermes_console_client.py keys "dir C:" 700    # type text, wait 700ms, return screen
+python3 hermes_console_client.py keys "$(printf '\r')" 900   # press Enter
+```
+
+Protocol v2 with **unique, unmistakable line prefixes** (user requirement — never confuse with stray traffic; the `8F27` suffix is fixed and identical in bridge/tray/client):
+```
+request : HERMES-REQ-8F27:<json>      (bridge IGNORES any line without this prefix)
+payload : HERMES-RES-8F27:<line>      (repeated, one per screen line)
+end     : HERMES-DONE-8F27:<op>       (exactly one per request; no DONE = bridge unhealthy)
+```
+Ops: `ping`, `hb` (one round trip: `pong <secs> <opCount> <VISIBLE|HIDDEN>`), `state`, `screen`, `history {lines}`, `keys {text}` (INSTANT — `wait` param removed, see Workflow discipline), `show`, `hide`, `activity`, `sysmenu`, `quit`. Special chars in `text`: `\r` Enter, `\b` Backspace, `\t` Tab, `\u0003` Ctrl+C, `\u001b` Esc.
+Other fixed unique identifiers: scheduled task `HERMES-CONSOLE`, tray mutex `HERMES-CONSOLE-TRAY`, logs `hermes_task.log` / `hermes_tray.log` / `hermes_bridge.log` under `E:\LOCAL_HERMES`, window title `HERMES-CONSOLE`, port `18799`. Test markers typed into the window: `HERMES-` prefixed (e.g. `echo HERMES-PFX-V2-OK`).
+`show`/`hide` are sent by the tray over TCP to the bridge — the bridge owns its console window; the tray never finds it by title (unreliable across conhost versions).
+
+## Workflow discipline
+
+- Type the command, then send Enter as a separate `keys` call, then read the returned screen. **`keys` NEVER sleeps (user rule 2026-10-15: «больше не используй сон в этом инструменте — мост должен быть надежным как скала»): the bridge injects and replies in milliseconds, always.** For long-running commands, poll `screen`/`history` afterwards — the bridge must stay instantly responsive to `hb`/tray/client while ANY command runs in the child.
+- The window starts HIDDEN; the tray icon near the clock is a traffic light: **ORANGE ready/idle, GREEN blinking (2 flashes per console op) while the agent works, YELLOW busy (bridge process alive but silent — the icon must never lie: a busy bridge is NOT down), RED down (process gone; worker restarts after 4 consecutive failed polls)**. The user opens/hides it themselves: double-click the icon or right-click menu Show/Hide/Restart/Endpoint/Quit. The menu's **Endpoint** section (tray v3.2): disabled label `Endpoint: <addr:port>` (also in the icon tooltip), `Auto-detect on this PC`, `Set host:port manually...` (small dialog, pure UI). The menu has NO hint/status lines anymore (user: «убери из меню строку found» + «убери верхнюю строку Console: hidden») — actions only; state lives in icon color + tooltip. Detect/manual results reach the user as **Windows balloon tips** (`status['balloon'] = @('info'|'warning', title, text)`, consumed by the UI paint timer via `TryRemove` — ConcurrentDictionary rejects null values, never assign `$null` to a key) with the full address in the text. If SEVERAL endpoints answer the protocol, the worker never guesses: it sets `status['pick']` (list of `{addr,port,why}`) and the UI timer opens a clickable pick dialog (`Show-PickDialog`, listbox + double-click = apply); the choice enqueues `!pick <host> <port>` which applies+persists like manual. Both enqueue worker commands (`!detect`, `!setep <host> <port>`): detect first probes the current endpoint, else enumerates listeners (sockets owned by a hermes_bridge process FIRST, then other listeners ≥1024 capped at 40) and protocol-probes each with `hb` — only a `pong` counts, a bare open port never does; on a hit it switches live AND saves `BIND=`/`PORT=` into `hermes_console.cfg` so the bridge the worker later launches listens there too. Endpoint lives ONLY in the shared $status cache (`Get-Endpoint`/`Set-Endpoint`) — runspace param vars can't be reassigned from functions. Check `state` (HIDDEN/VISIBLE) before work that is meant to be supervised: if `HIDDEN` and the task is visually-supervised-by-agreement, tell the user to open it from the tray icon — never send `show`/`hide` yourself, that is the user's control.
+- Long-lived state (cd, env vars) persists in the child cmd.exe between calls; if the child dies, the bridge respawns it on the next `keys` op (state lost).
+- To close: run `scripts/console_down.sh` (quit op + tunnel drop, paired) or the user closes the window. Never leave the bridge listening after the task ends.
+
+## Pitfalls
+
+- **NEVER `taskkill /im conhost.exe` or `/im python.exe` on the server.** conhost hosts ALL console windows in session 1 — killing it closed the user's Strata LLM console window (processes survived, window gone, unrecoverable without restarting the app). Kill only by exact PID, verified from CommandLine first. The Strata stack (strata.exe, strata-vision.exe, setup.py launchers on port 11434) must never be touched.
+
+- **PowerShell variable names are case-INSENSITIVE.** The bridge protocol prefix `$DONE` and a loop flag `$done` are the SAME variable — the first accept clobbered the prefix and the bridge sent `Falseping` instead of `HERMES-DONE-8F27:ping` (tray saw a dead bridge → restart storm). Protocol vars must have unique names no other var touches (`$endConn` for the flag).
+- **Task Scheduler kills the action's whole job object when the action exits.** A .bat action that spawns the tray via `start` and returns instantly KILLS the tray seconds later (empty tray log, no icon). The scheduled task must run the tray `powershell -File hermes_tray.ps1` DIRECTLY; the .bat remains only for manual double-click use.
+- **Bridge boot is slow (Add-Type ~2–5 s).** The tray must not treat a not-yet-answering bridge as dead: keep the launched PID, a 30 s grace after each launch, and wait up to 20 s after starting it before the timer re-checks. Otherwise the tray kills the booting bridge (it owns the port) and spawns a new one every few seconds — restart storm in the tray log.
+- **`Get-NetTCPConnection`-based health = must see `HERMES-DONE`.** A zombie old-protocol bridge accepts TCP and never answers; "connection succeeded" is NOT health. `Bridge-Alive` requires an exact `pong` + DONE line.
+- **Bash single-quoted strings swallow `''`** — `Name=''powershell.exe''` inside a single-quoted PS payload arrives at PowerShell UNQUOTED (parser error, silent when stderr is discarded). Use `` `" `` backtick-quotes inside single-quoted bash payloads, or double-quote the payload.
+- **`timeout` does not exist on macOS** — a command prefixed with it silently does nothing (exit 0, empty output). Use the terminal tool's own `timeout=` parameter.
+- **SSH PowerShell runs in session 0; desktop apps from the bridge open in session 1.** `EnumWindows`/`Get-Process MainWindowTitle`/UIAutomation from an SSH-launched process CANNOT see session-1 windows — "window not found" from SSH is meaningless. Verify GUI results via the user's eyes or via the bridge (it lives in session 1), not via SSH-side window enumeration.
+- **`start msedge` fails silently — Edge is not installed on the server.** Chrome is (`C:\Program Files\Google\Chrome\Application\chrome.exe`); use `start chrome <path>` or bare `start <file>` (html assoc = htmlfile). `psexec -i` cannot inject keystrokes into the interactive session remotely (SendKeys/AppActivate fail from a remote-launched process; confirmed by research + the local psexec.zip on the server is v2.43 and useless for this). Also `Expand-Archive` fails in a TTY-less SSH session (WriteProgress console host error), and Windows `tar` can't open the Sysinternals-signed zip. Don't retry those paths.
+- **schtasks /IT requires a user logged on at the console.** If session 1 is disconnected/locked, the window won't be visible — ask the user to unlock the monitor before visual work.
+- **Screen reads show junk:** trailing garbage cells after real text on each line (double-width cells) — trim right; last line is `CURSOR x y SIZE WxH`, not console output.
+- **Cyrillic in cmd output** may read back garbled from the buffer (codepage); don't trust it for exact text — re-run with ASCII output or `chcp 65001` in the window if exact text matters.
+- **Ctrl+C (`\u0003`) can leave a junk char on the input line** (e.g. `♥cd` → command not found). After sending it, read the screen; if the next command failed with a junk-prefixed name, retype cleanly (Escape, or backspaces) before continuing.
+- **Tunnel is a background ssh process on the Mac** and dies on reboot; if the client gets connection refused, re-raise it (the window on the server is unaffected).
+- **schtasks /query output is UTF-16** — piping it to local `grep` ALWAYS fails (GREP_RC=1 even when the task exists). Verify task existence via `cmd /c "schtasks /query /tn NAME /fo list | findstr /i /c:NAME >nul"` ON THE SERVER and read only the exit code. `/create` success wording is locale-dependent too (RU has no "success") — never grep for it; fact-check by querying back.
+- **A throw inside a bridge op handler drops the client connection mid-response** — clamp/validate op parameters in the handler (e.g. `history lines` clamped 1..9999 with try/catch around [int] cast); the outer try/catch hides it from the bridge but the client gets a truncated/missing reply.
+
+- **Never run destructive commands** in the window without the user watching and confirming scope — the visual channel is the safety mechanism, don't bypass it with plain SSH exec for the same task. If the window is minimized, ask the user to restore it before destructive operations.
+
+## Verified
+
+2026-10-14: deployed, window visible in session 1, typed `ver & hostname & whoami` + Enter through the bridge, read back `DESKTOP-SERVER` / `desktop-server\user` from the screen buffer. 3/3 ops (ping/keys/screen) working.
+2026-10-14 (tray mode): cold start via console_up.sh → `state`=MINIMIZED; typed `echo TRAY-KEEP-OK` + Enter → marker read from screen, `state` still MINIMIZED (bridge re-minimizes after input because conhost auto-restores a minimized console on keystrokes). User-restored window stays restored (wasMin=false → no re-minimize).
+2026-10-14 (tray applet + protocol v2): separate tray process with NotifyIcon near the clock (green `H`, red when bridge down), double-click + menu Show/Hide/Restart/Quit; bridge is its hidden child process. After fixing the `$DONE`/`$done` collision and task-action issue: cold start → `tray: bridge is alive`, client `ping`→`pong`, `state`=HIDDEN, marker `PFX-V2-OK` read from screen twice, `show`→VISIBLE, `hide`→HIDDEN, cwd still `E:\AI`, exactly one tray + one bridge process, no restart storm. Protocol prefixes `HERMES-REQ-8F27:` / `HERMES-RES-8F27:` / `HERMES-DONE-8F27:` verified end-to-end through the SSH tunnel.
+2026-10-15 (tray v3, menu freeze fix): right-click menu froze because the tray did ALL bridge networking on the UI thread (blocking TcpClient.Read 5s every 500 ms) + a `DoEvents(); Sleep(60)` pump loop. ContextMenuStrip itself is fine — do NOT replace the menu; fix = UI thread NEVER touches a socket. Architecture: worker [PowerShell]::Create() runspace owns all I/O (hb poll, supervision, restart, queued commands); UI reads a ConcurrentDictionary cache; menu handlers only Enqueue to a ConcurrentQueue; pump = Application.Run(ApplicationContext), Quit calls ctx.ExitThread(). hb = "pong <secs> <ops> <VISIBLE|HIDDEN>". Worker guard: "bridge silent but its process is alive (booting/busy) - not touching it" + 4 consecutive failures before DOWN (busy bridge queues our connect — timeout ≠ dead). Worker logs `UI STALL <ms>` when the paint timer's uiBeat goes >1600 ms stale — verified 0 stalls while the bridge was busy 13 s.
+2026-10-15 (window position, user-specified "положение окна - 1366 \ 844"): bridge startup applies the exact top-left corner 1366x844 px via SetWindowPos(SWP_NOSIZE) after font/size setup, clamped inside the virtual screen (GetSystemMetrics 76-79 — works across the 3-monitor layout); `show` re-asserts the same position because conhost moves the window back on restore. Fact-check: setup log and `show` reply both print "POS 1366x844 (555x199px)" (555x199px = 87x16 cells at 6x10 font + frame — self-consistent). The Properties-dialog "Автоматический выбор" checkbox is irrelevant now: the bridge hard-sets position at startup and on every show.
+2026-10-15 (console appearance defaults, user screenshots): bridge startup applies: buffer 87x9999, window 87x16, font Lucida Console size 10 = 6x10 PIXELS via SetCurrentConsoleFontEx (FontFamily 0x0030 FF_MODERN, weight 400), default colors white-on-blue. Facts verified after cold start: `SIZE 87x9999 WINDOW 87x16 ATTR 0x1F`, log "console setup done -> Lucida Console 6x10px". Pitfalls found: (1) kernel32 has NO SetConsoleScreenBufferInfo (only Ex variants); (2) CONSOLE_SCREEN_BUFFER_INFOEX struct must END with dwFontSize (official layout) else cbSize wrong → ERROR_INVALID_PARAMETER; (3) on THIS conhost Get/SetConsoleScreenBufferInfoEx return false outright (probe-verified) — colors must be set via cmd built-in `color 1f` typed at startup (persists across cls); startup sequence is now: wait 1.5s → Send "color 1f\r" → Send "cls\r" (neither counted in opCount). (4) ShowWindow(SW_SHOW) around the setup block: font/size calls hang on a hidden console. history/screen trailer now prints "CURSOR x y SIZE wxh WINDOW WxH ATTR 0xNN" — every appearance setting is fact-checkable via client `history`.
+2026-10-15 (no-sleep bridge + history persistence + honest icon, user rules): (1) `keys` op no longer sleeps — inject + reply instantly; long commands verified: `keys "ping -n 12 ..."` returned in 0.08 s and `hb` answered `pong 0 5 VISIBLE` DURING the 12 s command. (2) Scrollback is persisted to `E:\LOCAL_HERMES\hermes_history.txt` (rolling 400 lines, plain UTF-8 — no SQLite needed; PowerShell has no sqlite3 built in and a text file survives any crash) after every keys/screen/history op and on `quit`; on bridge startup, if the file exists, `Restore-History` replays it into the fresh buffer via `WriteConsoleW` at cursor (0,0) — no echo, no execution — so after a crash/restart the console shows the previous records «как будто ничего и не случилось»; `cls` only on a truly fresh install. Verified end-to-end: marker `PRE-RESTART-MARKER-77` → killed bridge PID by CommandLine match → tray worker auto-relaunched (log `bridge launched pid=11608`) → log `hist-restore: replayed 3 lines` → marker found in new console's history. (3) Tray icon honesty: alive-but-silent bridge = YELLOW `bridge BUSY (working)`, never RED; RED only when the process is actually gone. (4) Client pitfall found during this work: client `hb` subcommand branch was missing after a rewrite → empty output looked like a dead bridge while the bridge log showed every `hb` served; when output is empty, check the bridge log before blaming the bridge.
+2026-10-15 (keys Enter regression — CRITICAL agent pitfall): `keys` text had NO trailing Enter in ANY version (client sent raw text, bridge injected raw) — typed commands sat on the input line unexecuted, and screen/history greps matched the TYPED COMMAND TEXT, producing false-positive "marker found" validations (this silently invalidated several earlier test rounds). Fix (both layers, idempotent): client appends `\r` if missing; bridge `keys` handler appends trailing CR unless the request has `"enter":0` (type-without-run). Validate execution by checking the marker appears as a line WITHOUT the `echo ` prefix (output line), never by substring grep of the screen. Also: a stuck console (typed text not executing) is fixed by seam `!restart` (fresh cmd child).
+2026-10-15 (tray v3.2 balloon + pick UX, user: «из строки меню - ее надо убрать... выводить подсказку... если найдено несколько - окно с выбором кликом»): removed `Console: ...` status line and `found ...` hint line from the context menu (menu = actions only). Auto-detect/manual/pick results now: single hit → balloon info with full address; none → balloon warning; several answering → `status['pick']` → UI opens clickable listbox dialog (double-click applies) → `!pick h p` applies+persists. Seam helpers (test-only, never in menu): `!multitest` queues a fixed 3-endpoint pick, `!pickfirst` re-enqueues the pending pick's first row — beware the race: the UI timer (300ms) consumes `status['pick']` before a following seam command reads it, so `pickfirst` after `multitest` legitimately logs "no pending pick dialog"; that log proves the timer path fired. Verified: `!pick 127.0.0.1 18901` → `endpoint ... (detect: picked by user)` + cfg `PORT=18901`; restore `!setep 127.0.0.1 18799` → cfg back, `hb` → `pong`; balloon/pick code wrapped in try/catch in the timer (a WinForms throw there would freeze the icon); fake protocol-speaking listeners for multi-hit tests = tiny TcpListener PS scripts answering `HERMES-RES-8F27:pong...` (start via console `start /min powershell -File`, kill by CommandLine match, delete the scripts after).
+2026-10-15 (tray v3.1 endpoint menu, user request «кнопка авто определения хоста и порта + вручную указать из контекстного меню»): menu section Endpoint = live label + Auto-detect + manual dialog; the label `Endpoint: <addr:port>` is the ONLY place the address shows — the hint line explains HOW it was obtained ("found (current endpoint answers)", "none (N probes)", "manual (typed in the dialog)") and must never repeat the address (user: «зачем в меню дважды присутствует и endpoint и found»); all actions run in the worker, UI only enqueues. Verified end-to-end via the file seam `E:\LOCAL_HERMES\tray_cmd.txt` (one line `!detect` / `!setep h p`, consumed by the worker each loop — also the manual escape hatch for menu commands without clicking): `cmd-file: [!detect]` → `detect: current endpoint 127.0.0.1:18799 answers, keeping it`; `!setep 127.0.0.1 18800` → `endpoint ... (manual)` + `cfg: endpoint saved`, cfg on disk became `PORT=18800`/`BIND=127.0.0.1`; `!setep 127.0.0.1 18799` → `bridge back after 16 failed polls`, client `hb` → `pong`. Pitfalls: (1) PS 5.1 parser REJECTS `(switch(...){...}) + string` — parenthesized switch in expression position is a parse error ("отсутствует закрывающий токент {"); use `$(switch...)`. Validate deployed .ps1 with `[System.Management.Automation.Language.Parser]::ParseFile` over SSH — no local pwsh here (brew cask pwsh install never completed). (2) bash single-quotes inside remote PS payloads break; feed scripts via `powershell -Command -` with stdin, and wrap cmd redirects as `cmd /c "echo x> path"` (the redirect must be inside the quotes or the LOCAL shell eats it). (3) Get-NetTCPConnection LocalAddress `::`/`0.0.0.0` → probe as 127.0.0.1; hostname BIND strings resolve via Dns::GetHostAddresses in both bridge and tray.
+2026-10-14 (X-close guard + scrollback, user requirement "закрываю окно крестиком — записи не должны теряться"): the console window's X killed conhost → bridge+cmd died → history gone (that was the real crash source, NOT the socket try/catch). Fix in bridge: `LockClose()` — DeleteMenu(SC_CLOSE) + EnableMenuItem grayed on the console HWND at startup; X/Alt+F4 are dead, closing goes ONLY through the tray (Hide/Quit). Fact-check op `sysmenu` returns 3=absent/2=disabled/0=closable. Second history-loss cause: `mode con: lines=40` also shrinks the BUFFER to 40 — fix `SetBufferSize(120,9999)` right after mode. New op `history {lines}` reads the whole scrollback via ReadConsoleOutputCharacterW row-by-row + prints "CURSOR x y SIZE wxh" trailer (used to verify buffer facts). Client gained `history [lines]`. Verified: sysmenu=3, SIZE 120x9999, 15/15 markers found in history, bridge PID stable through the whole burst.
+2026-10-15 (deep code review + linters pass, user rule «перед пушем — глубокая проверка, линтеры, ревью, UX»): linters actually run: pyflakes on the client (clean), `bash -n` on both shell scripts, PS 5.1 `Parser::ParseFile` over SSH on both .ps1 (0 errors) — no local pwsh, no shellcheck (not installable quickly). Fixes applied from the review: (1) removed dead `Get/SetConsoleScreenBufferInfoEx` C# from the bridge (probe proved this conhost fails the Get; the code was unreachable weight); (2) bridge `history` now clamps lines 1..9999 with try/catch (bad param used to throw inside the handler → truncated reply); (3) client: `run()` wraps requests → one clean `ERROR: cannot reach bridge at HOST:PORT` line + tunnel hint instead of a socket traceback, validates `--port` 1-65535, `history LINES` numeric, `keys` without arg prints usage, `sysmenu` command added; (4) tray: worker loop `while($true)` ON PURPOSE — queue must drain after $stop or a queued `!quit` orphans the bridge; seam `!quit` sets status['quitui'] → paint timer closes the UI (no zombie icon); `$immediate` skips the 800ms poll sleep after `!setep`/`!detect` switch and menu restart (icon truth in ~1s, verified: setep-back → `bridge back after 4 failed polls` within ~2s); menu `!restart` launches the bridge directly in the handler, not via 4 failed supervision polls; `!setep` rejects port 0/65536+ with log + menu-visible error; detect results carry detail strings shown verbatim in the menu hint ("found: 127.0.0.1:18799 answers", "none (N probes)"); (5) UX: live disabled menu line `Console: VISIBLE on the monitor / HIDDEN (double-click the icon to open) / bridge DOWN / starting...`; both logs rotate at startup when >1MB (→ `.log.old`); (6) up.sh: `schtasks /create` failure is now FACT-checked by querying the task back through server-side `cmd|findstr` (UTF-16 output defeats local grep — false WARN seen and fixed), `/run` failure prints WARN. Verified after all fixes: cold start clean (no WARN), `hb`→pong, seam `!toggle`→VISIBLE→`!toggle`→HIDDEN, `echo FINAL-CHECK-1` round-trip, trailer `SIZE 87x9999 WINDOW 87x16 ATTR 0x1F`, UI STALL count 0.

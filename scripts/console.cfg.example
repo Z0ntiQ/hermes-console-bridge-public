@@ -1,0 +1,28 @@
+# console.cfg — copy to "console.cfg" (same folder) and fill in for YOUR server.
+# Real console.cfg is git-ignored: host, user and key paths stay on your machine.
+# Every key can also be given as env var with HC_ prefix (env wins over this file).
+
+# SSH target of the Windows server (user@address)
+HOST=user@192.168.1.10
+
+# SSH private key (full path; default: ~/.ssh/id_ed25519)
+#KEY=/home/me/.ssh/id_ed25519
+
+# bridge TCP port (server-side listen AND local tunnel endpoint)
+PORT=18799
+
+# TUNNEL=ssh   -> this script raises its own "ssh -L PORT:127.0.0.1:PORT" (default)
+# TUNNEL=none  -> the tunnel is realized some other way (cloudflared, Tailscale serve,
+#                 socat, an already-open port...). No ssh -L is raised; set HC_HOST to
+#                 the address that tunnel exposes.
+TUNNEL=ssh
+
+# where the bridge is reachable FROM THIS MACHINE (default 127.0.0.1 = via ssh -L;
+# with TUNNEL=none set your tunnel's address here)
+#HC_HOST=127.0.0.1
+
+# optional: refuse to operate if `hostname` on the SSH target differs (empty = skip)
+EXPECT_HOST=
+
+# server folder holding hermes_tray.ps1 / hermes_bridge.ps1
+PS1_DIR=E:\LOCAL_HERMES
