@@ -1,4 +1,4 @@
-﻿# hermes_tray.ps1 v3.2: non-blocking UI + endpoint menu + balloon feedback (no hint lines in menu)
+﻿# hermes_tray.ps1 v3.3: non-blocking UI + endpoint menu + balloon feedback + default-folder menu
 # A noticeable icon in the notification area (near the clock) supervising the HERMES-CONSOLE bridge.
 #   left double-click = show/hide console
 #   right-click menu  = Show / Hide / Restart bridge / Endpoint (auto-detect on this PC,
@@ -35,6 +35,7 @@ function CfgVal($name, $default) {
 }
 $bridgeBind = [string] (CfgVal 'BRIDGE_BIND' '127.0.0.1')   # address the bridge listens on (server-side)
 $bridgePort = [int] (CfgVal 'PORT' 18799)
+$workDir0 = [string] (CfgVal 'WORKDIR' 'E:\AI')             # console default folder (shown in tooltip, editable in menu)
 $bridgeScript = Join-Path $here 'hermes_bridge.ps1'
 $tlog = Join-Path $here 'hermes_tray.log'
 # hygiene: cap log growth — rotate once at startup (tray restarts are rare), keep .old for triage
@@ -52,6 +53,7 @@ $status['visible'] = $false
 $status['uiBeat'] = $null      # last UI timer tick — used to MEASURE UI-thread stalls
 $status['endpoint'] = ($bridgeBind + ':' + $bridgePort)   # live "addr:port" the tray talks to (menu shows it)
 $status['detect'] = 'idle'     # idle | scanning | found | none | manual  (endpoint auto-detect feedback)
+$status['workdir'] = $workDir0 # console default folder (tooltip + 'Set default folder...' menu)
 $cmds = New-Object 'System.Collections.Concurrent.ConcurrentQueue[string]'
 $stop = New-Object System.Threading.ManualResetEventSlim($false)
 
@@ -111,24 +113,27 @@ $workerBody = {
   }
 
   # ---- persist endpoint into hermes_console.cfg so the bridge WE launch listens on the same place ----
-  function Upsert-Cfg([string]$addr, [int]$port) {
+  function Upsert-CfgKey([string]$key, [string]$value) {
+    # generic key upsert (BIND/PORT/WORKDIR): read cfg, replace the key or prepend it, write back.
     try {
       $lines = @()
       if (Test-Path $cfgFile) { $lines = @(Get-Content $cfgFile -ErrorAction SilentlyContinue) }
-      $out = @(); $sawB = $false; $sawP = $false
+      $out = @(); $saw = $false
       foreach ($l in $lines) {
-        if ($l -match '^\s*([A-Za-z_]+)\s*=') {
-          $k = $matches[1].ToUpper()
-          if ($k -eq 'BIND') { $out += ('BIND=' + $addr); $sawB = $true; continue }
-          if ($k -eq 'PORT') { $out += ('PORT=' + $port); $sawP = $true; continue }
+        if ($l -match '^\s*([A-Za-z_]+)\s*=' -and $matches[1].ToUpper() -eq $key.ToUpper()) {
+          $out += ($key + '=' + $value); $saw = $true; continue
         }
         $out += $l
       }
-      if (-not $sawB) { $out = @('BIND=' + $addr) + $out }
-      if (-not $sawP) { $out = @('PORT=' + $port) + $out }
+      if (-not $saw) { $out = @($key + '=' + $value) + $out }
       Set-Content -Path $cfgFile -Value $out -Encoding UTF8
-      WLog ('cfg: endpoint saved to ' + $cfgFile)
-    } catch { WLog ('cfg save failed: ' + $_.Exception.Message) }
+      WLog ('cfg: ' + $key + '=' + $value + ' saved to ' + $cfgFile)
+      return $true
+    } catch { WLog ('cfg save failed: ' + $_.Exception.Message); return $false }
+  }
+  function Upsert-Cfg([string]$addr, [int]$port) {
+    [void] (Upsert-CfgKey 'BIND' $addr)
+    [void] (Upsert-CfgKey 'PORT' ([string] $port))
   }
 
   # Apply a new endpoint everywhere at once: shared cache (worker loop + menu + tooltip) + config file.
@@ -174,6 +179,7 @@ $workerBody = {
   $bridgeProc = $null
   $lastLaunch = $null
   $fails = 0
+  $wdPoll = 0   # counter for periodic 'wd' fetches (tooltip/menu folder stays honest)
   # optional manual seam: write a line "!file <cmd>" into tray_cmd.txt (same folder) to enqueue
   # a menu command from outside the UI — same handlers, same queue. ("!detect", "!setep h p", ...)
   $cmdFile = (Split-Path -Parent $tlog) + '\tray_cmd.txt'
@@ -292,6 +298,29 @@ $workerBody = {
           $status['balloon'] = @('info', 'HERMES: address applied', ('Selected ' + $matches[1] + ':' + $np2 + ' - applied and saved.'))
           $immediate = $true
         }
+      } elseif ($j -match '^!setwd (.+)$') {
+        # default console folder: save WORKDIR into the cfg, then relaunch the bridge so it
+        # re-reads the cfg and starts cmd.exe in the NEW folder (history file is path-independent).
+        # The bridge CREATES a missing folder at startup, but a file in place of the path must fail
+        # with an honest balloon instead of a silent restart into confusion.
+        $wd = $matches[1].Trim().Trim('"')
+        if (-not $wd) {
+          $status['balloon'] = @('warning', 'HERMES: bad folder', 'Folder path is empty - nothing changed.')
+        } elseif ((Test-Path -LiteralPath $wd -PathType Leaf)) {
+          $status['balloon'] = @('warning', 'HERMES: bad folder', ('This is a file, not a folder: ' + $wd + ' - nothing changed.'))
+          WLog ('setwd: refused, path is a file: ' + $wd)
+        } else {
+          if (Upsert-CfgKey 'WORKDIR' $wd) {
+            $status['workdir'] = $wd
+            $status['balloon'] = @('info', 'HERMES: folder applied',
+              ('Default folder applied and saved: ' + $wd + ' - bridge restarted there.'))
+            WLog ('setwd: WORKDIR=' + $wd + ' - restarting bridge into it')
+            $cmds.Enqueue('!restart')
+            $immediate = $true
+          } else {
+            $status['balloon'] = @('warning', 'HERMES: save failed', ('Could not write WORKDIR into ' + $cfgFile + ' - nothing changed.'))
+          }
+        }
       } elseif ($j -eq '!pickfirst') {
         # seam-only: click the first row of a pending pick dialog (test helper for the pick chain)
         $pend = $null
@@ -323,6 +352,16 @@ $workerBody = {
       $p = $r[0] -split ' '
       if ($p.Count -ge 3) { $status['ops'] = [int] $p[2] }
       if ($p.Count -ge 4) { $status['visible'] = ($p[3] -eq 'VISIBLE') }
+      # keep the folder shown in tooltip/menu honest: the BRIDGE knows where cmd.exe really
+      # started (a manual cfg edit or a bridge restart with another cfg must stay visible).
+      $wdPoll = $wdPoll + 1
+      if ($wdPoll -ge 15) {
+        $wdPoll = 0
+        $wr = Invoke-Bridge '{"op":"wd"}' 1500
+        if ($null -ne $wr -and $wr.Count -ge 1 -and $wr[0] -and $wr[0] -notlike 'ERR*') {
+          $status['workdir'] = $wr[0].Trim()
+        }
+      }
     } else {
       $fails++
       if ($fails -ge 4) {
@@ -423,6 +462,11 @@ $miEpLabel = $menu.Items.Add('Endpoint: -')
 $miEpLabel.Enabled = $false
 $miEpAuto = $menu.Items.Add('Auto-detect on this PC')
 $miEpManual = $menu.Items.Add('Set host:port manually...')
+# ---- Folder section: default working folder of the console (WORKDIR), editable without files ----
+[void] $menu.Items.Add('-')
+$miWdLabel = $menu.Items.Add('Folder: -')
+$miWdLabel.Enabled = $false
+$miWdSet = $menu.Items.Add('Set default folder...')
 [void] $menu.Items.Add('-')
 $miQuit = $menu.Items.Add('Quit')
 $ni.ContextMenuStrip = $menu
@@ -430,6 +474,10 @@ $ni.ContextMenuStrip = $menu
 # Refresh the endpoint label each time the menu opens — reads the shared cache only, no I/O.
 $menu.Add_Opening({
   $script:miEpLabel.Text = 'Endpoint: ' + [string] $script:status['endpoint']
+  $wdTxt = [string] $script:status['workdir']
+  # tooltip/menu text has a hard cap in Windows; trim long paths from the middle, keep the tail
+  if ($wdTxt.Length -gt 50) { $wdTxt = '...' + $wdTxt.Substring($wdTxt.Length - 47) }
+  $script:miWdLabel.Text = 'Folder: ' + $wdTxt
 })
 
 # Manual endpoint dialog: pure UI (textboxes), no sockets — safe on the UI thread.
@@ -506,6 +554,20 @@ $miEpManual.Add_Click({
   $spec = Show-EndpointDialog
   if ($spec) { $script:cmds.Enqueue(('!setep ' + $spec)) }
 })
+$miWdSet.Add_Click({
+  # native folder picker (Start-Path prefilled with the current folder); pure UI, the worker
+  # does the apply (cfg write + bridge restart). Cancel leaves everything untouched.
+  $fb = New-Object System.Windows.Forms.FolderBrowserDialog
+  $fb.Description = 'Default folder for the HERMES console (WORKDIR)'
+  $cur = [string] $script:status['workdir']
+  if ($cur -and (Test-Path -LiteralPath $cur -PathType Container)) { $fb.SelectedPath = $cur }
+  $res = $fb.ShowDialog()
+  $sel = $fb.SelectedPath
+  $fb.Dispose()
+  if ($res -eq [System.Windows.Forms.DialogResult]::OK -and $sel) {
+    $script:cmds.Enqueue(('!setwd ' + $sel))
+  }
+})
 $script:running = $true
 $miQuit.Add_Click({
   $script:cmds.Enqueue('!quit')
@@ -566,16 +628,19 @@ $timer.Add_Tick({
     }
   }
   $epNow = [string] $script:status['endpoint']
-  if ($state -ne $script:lastState -or $epNow -ne $script:lastEp) {
+  $wdNow = [string] $script:status['workdir']
+  if ($wdNow.Length -gt 40) { $wdNow = '...' + $wdNow.Substring($wdNow.Length - 37) }   # tooltip cap
+  if ($state -ne $script:lastState -or $epNow -ne $script:lastEp -or $wdNow -ne $script:lastWd) {
     $script:ni.Icon = Make-Icon $state
     $script:ni.Text = $(switch ($state) {
       'red'    { 'HERMES-CONSOLE - bridge DOWN' }
       'yellow' { 'HERMES-CONSOLE - bridge BUSY (working)' }
       'green'  { 'HERMES-CONSOLE - agent WORKING' }
       default  { 'HERMES-CONSOLE - ready (idle)' }
-    }) + ' @ ' + $epNow
+    }) + ' @ ' + $epNow + ' | ' + $wdNow
     $script:lastState = $state
     $script:lastEp = $epNow
+    $script:lastWd = $wdNow
   }
 })
 $timer.Start()

@@ -451,6 +451,9 @@ while ($true) {
         $s = -1
         if ($script:lastActivity) { $s = [int]((Get-Date) - $script:lastActivity).TotalSeconds }
         Reply $ns $s; Done $ns 'activity'
+      } elseif ($op.op -eq 'wd') {
+        # current working directory of the console (fact-check for tray tooltip / client `wd`)
+        Reply $ns $workDir; Done $ns 'wd'
       } elseif ($op.op -eq 'hb') {
         # heartbeat for the tray: liveness + activity + visibility in ONE round trip
         # ("pong <secs> <opCount> <VISIBLE|HIDDEN>") — the tray worker polls this and never blocks UI

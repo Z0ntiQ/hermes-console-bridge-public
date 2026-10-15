@@ -92,6 +92,8 @@ if __name__ == "__main__":
         run({"op": "state"})
     elif cmd == "hb":
         run({"op": "hb"}, timeout=10)
+    elif cmd == "wd":
+        run({"op": "wd"})   # console default folder (what WORKDIR resolves to on the server)
     elif cmd == "screen":
         run({"op": "screen"})
     elif cmd == "history":
