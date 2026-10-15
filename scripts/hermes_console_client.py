@@ -157,7 +157,9 @@ if __name__ == "__main__":
                     ident = request({"op": "tab"}, timeout=2)
                 except OSError:
                     ident = ""
-                label = ident.split("label=", 1)[1].strip() if "label=" in ident else ""
+                # split BEFORE strip: an empty label makes the reply "label= pid=1234" and the
+                # leading space is what separates the label from the pid field
+                label = ident.split("label=", 1)[1].split(" pid=", 1)[0].strip() if "label=" in ident else ""
                 rows.append("T%d\tport=%d\t%s\tops=%s\t%s" % (t, PORT, vis, ops, ("label=" + label) if label else ""))
         if not rows:
             print("no tabs answering on ports %d..%d" % (BASE_PORT, BASE_PORT + MAX_TABS - 1))

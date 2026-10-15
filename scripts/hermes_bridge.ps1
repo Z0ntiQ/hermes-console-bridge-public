@@ -678,7 +678,10 @@ while ($true) {
           Reply $ns ('queued: ' + $verb + ' (the tray applies it in the desktop session)'); Done $ns $op.op
         } catch { Reply $ns ('ERR cannot write ' + $seam + ': ' + $_.Exception.Message); Done $ns $op.op }
       } elseif ($op.op -eq 'tab') {
-        Reply $ns ('T' + $Tab + ' port=' + $port + ' label=' + $TabLabel); Done $ns 'tab'
+        # pid= is for the tray's tabs panel: the tray's worker runspace has CIM DENIED by its
+        # scheduled-task token (probe-verified), so it cannot find the bridge by port owner —
+        # the bridge reports its own PID instead.
+        Reply $ns ('T' + $Tab + ' port=' + $port + ' label=' + $TabLabel + ' pid=' + $PID); Done $ns 'tab'
       } elseif ($op.op -eq 'geom') {
         # fact-check for the agent/tray: current placement (showCmd, normal rect, live rect)
         Reply $ns ([WinCon]::PlacementStr()); Done $ns 'geom'

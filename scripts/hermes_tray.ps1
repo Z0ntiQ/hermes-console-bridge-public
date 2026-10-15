@@ -1,8 +1,15 @@
-﻿# hermes_tray.ps1 v4.0: TABS (several consoles, one bridge per tab) + non-blocking UI + endpoint
+﻿# hermes_tray.ps1 v4.1: TABS PANEL (Chrome-style tab strip + per-tab process tree, owned by the
+# tray) + TABS (several consoles, one bridge per tab) + non-blocking UI + endpoint
 # menu + balloon feedback + per-tab and default folder.
 # A tab = a separate HERMES-CONSOLE window/process/port (base + tab - 1). One console has exactly
 # ONE input queue, so a tab busy with a long-lived server (START.bat -> ComfyUI) cannot accept other
 # input; separate consoles are the only way to have several live, independently driven terminals.
+# v4.1 adds the TABS PANEL: a small Chrome-like window owned by the tray (always in the desktop
+# session): a tab strip on top (rounded tabs, active one white, + button) and under it the process
+# tree of the selected tab (bridge -> cmd -> whatever runs there, with CPU time and RAM). Clicking
+# a tab focuses its console window (SetForegroundWindow), double-click shows/hides it. The panel
+# reads the worker's tab table through the same $status seam the menu uses; it never talks to the
+# bridges itself.
 # A noticeable icon in the notification area (near the clock) supervising the HERMES-CONSOLE bridge.
 #   left double-click = show/hide console
 #   right-click menu  = Show / Hide / Restart bridge / Endpoint (auto-detect on this PC,
@@ -19,6 +26,91 @@
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+# window focus + console HWND lookup for the tabs panel (click a tab -> its console to front)
+Add-Type -Namespace TrayWin -Name Win -MemberDefinition @'
+[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+public delegate bool EnumWinCB(IntPtr h, IntPtr l);
+[DllImport("user32.dll")] public static extern bool EnumWindows(EnumWinCB cb, IntPtr l);
+[DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowTextW(IntPtr h, System.Text.StringBuilder s, int n);
+[DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassNameW(IntPtr h, System.Text.StringBuilder s, int n);
+// Console window of a tab by its title tag. Hidden consoles keep their HWND (the bridge only
+// ShowWindow(SW_HIDE)s), so EnumWindows finds them too.
+public static IntPtr FindConsoleHwnd(string tag) {
+  IntPtr found = IntPtr.Zero;
+  EnumWinCB cb = delegate(IntPtr h, IntPtr l) {
+    var cls = new System.Text.StringBuilder(64); GetClassNameW(h, cls, cls.Capacity);
+    if (cls.ToString() != "ConsoleWindowClass") return true;
+    var t = new System.Text.StringBuilder(512); GetWindowTextW(h, t, t.Capacity);
+    if (t.ToString().IndexOf(tag, System.StringComparison.OrdinalIgnoreCase) >= 0) { found = h; return false; }
+    return true;
+  };
+  EnumWindows(cb, IntPtr.Zero);
+  return found;
+}
+// ---- process snapshot: CIM is DENIED for the tray's worker runspace (probe-verified:
+// "Access denied" every cycle, while the same query works from cmd children and SSH).
+// Toolhelp32 + psapi need no WMI and no elevation, and cost microseconds.
+[StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
+public struct PROCESSENTRY32 {
+  public uint dwSize; public uint cntUsage; public uint th32ProcessID;
+  public IntPtr th32DefaultHeapID; public uint th32ModuleID;
+  public uint cntThreads; public uint th32ParentProcessID;
+  public int pcPriClassBase; public uint dwFlags;
+  [MarshalAs(UnmanagedType.ByValTStr, SizeConst=260)] public string szExeFile;
+}
+[StructLayout(LayoutKind.Sequential)] public struct FILETIME { public uint dwLowDateTime; public uint dwHighDateTime; }
+[StructLayout(LayoutKind.Sequential)]
+public struct PMC {
+  public uint cb; public uint PageFaultCount;
+  public UIntPtr PeakWorkingSetSize; public UIntPtr WorkingSetSize;
+  public UIntPtr QuotaPeakPagedPoolUsage; public UIntPtr QuotaPagedPoolUsage;
+  public UIntPtr QuotaPeakNonPagedPoolUsage; public UIntPtr QuotaNonPagedPoolUsage;
+  public UIntPtr PagefileUsage; public UIntPtr PeakPagefileUsage;
+}
+public class ProcRow {
+  public int pid { get; set; }
+  public int ppid { get; set; }
+  public string name { get; set; }
+  public long cpuMs { get; set; }
+  public double ramMB { get; set; }
+}
+[DllImport("kernel32.dll")] static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint pid);
+[DllImport("kernel32.dll", CharSet=CharSet.Unicode)] static extern bool Process32First(IntPtr h, ref PROCESSENTRY32 e);
+[DllImport("kernel32.dll", CharSet=CharSet.Unicode)] static extern bool Process32Next(IntPtr h, ref PROCESSENTRY32 e);
+[DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+[DllImport("kernel32.dll")] static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
+[DllImport("kernel32.dll")] static extern bool GetProcessTimes(IntPtr h, out FILETIME c, out FILETIME e, out FILETIME k, out FILETIME u);
+[DllImport("kernel32.dll")] static extern bool K32GetProcessMemoryInfo(IntPtr h, out PMC pmc, uint cb);   // NOT psapi.dll: on 19045 K32* lives in kernel32, psapi has no such entry point (caught live: "entry point not found")
+static long F2L(FILETIME t) { return ((long)t.dwHighDateTime << 32) | (long)t.dwLowDateTime; }
+public static System.Collections.Generic.List<ProcRow> Snapshot() {
+  var list = new System.Collections.Generic.List<ProcRow>();
+  IntPtr h = CreateToolhelp32Snapshot(0x00000002, 0);   // TH32CS_SNAPPROCESS
+  if (h == (IntPtr)(-1)) return list;
+  try {
+    PROCESSENTRY32 pe = new PROCESSENTRY32();
+    pe.dwSize = (uint)System.Runtime.InteropServices.Marshal.SizeOf(typeof(PROCESSENTRY32));
+    if (Process32First(h, ref pe)) {
+      do {
+        var row = new ProcRow { pid = (int)pe.th32ProcessID, ppid = (int)pe.th32ParentProcessID, name = pe.szExeFile };
+        IntPtr hp = OpenProcess(0x1410, false, pe.th32ProcessID);   // QUERY_LIMITED|QUERY_INFO|VM_READ
+        if (hp == IntPtr.Zero) hp = OpenProcess(0x1000, false, pe.th32ProcessID);
+        if (hp != IntPtr.Zero) {
+          try {
+            FILETIME c, e2, k, u;
+            if (GetProcessTimes(hp, out c, out e2, out k, out u)) row.cpuMs = (F2L(k) + F2L(u)) / 10000;
+            PMC pmc = new PMC();
+            pmc.cb = (uint)System.Runtime.InteropServices.Marshal.SizeOf(typeof(PMC));
+            if (K32GetProcessMemoryInfo(hp, out pmc, pmc.cb)) row.ramMB = (double)(ulong)pmc.WorkingSetSize / 1048576.0;
+          } finally { CloseHandle(hp); }
+        }
+        list.Add(row);
+      } while (Process32Next(h, ref pe));
+    }
+  } finally { CloseHandle(h); }
+  return list;
+}
+'@ -Language CSharp
 
 $mutex = New-Object System.Threading.Mutex($false, 'HERMES-CONSOLE-TRAY')
 if (-not $mutex.WaitOne(0)) { exit 0 }   # another tray instance already runs
@@ -188,7 +280,7 @@ $workerBody = {
   $tabs = @{}   # tab id -> hashtable(tab, port, label, workdir, proc, lastLaunch, fails, state, visible, ops)
   function New-TabState([int] $t, [string] $label, [string] $wd) {
     $h = @{ tab = $t; port = ($bridgePort + $t - 1); label = $label; workdir = $wd
-            proc = $null; lastLaunch = $null; fails = 0; state = 'down'; visible = $false; ops = -1 }
+            proc = $null; lastLaunch = $null; fails = 0; state = 'down'; visible = $false; ops = -1; procs = @() }
     $tabs[$t] = $h
     return $h
   }
@@ -198,6 +290,7 @@ $workerBody = {
     if ($h['workdir']) { $a += @('-WorkDir',  $h['workdir']) }
     $h['lastLaunch'] = Get-Date
     $h['proc'] = Start-Process -FilePath 'powershell.exe' -ArgumentList $a -WindowStyle Hidden -PassThru
+    $h['bpid'] = [int] $h['proc'].Id
     WLog ('tab ' + $h['tab'] + ': launched pid=' + $h['proc'].Id + ' port=' + $h['port'] + ' wd=' + $h['workdir'])
   }
   function Publish-Tabs {
@@ -205,7 +298,7 @@ $workerBody = {
     foreach ($k in ($tabs.Keys | Sort-Object)) {
       $h = $tabs[$k]
       $arr += [pscustomobject]@{ tab = $h['tab']; port = $h['port']; label = $h['label']; workdir = $h['workdir']
-                                 state = $h['state']; visible = $h['visible']; ops = $h['ops'] }
+                                 state = $h['state']; visible = $h['visible']; ops = $h['ops']; procs = $h['procs'] }
     }
     $status['tablist'] = $arr
   }
@@ -223,6 +316,12 @@ $workerBody = {
     WLog ('tab ' + $t + ': closed (' + $why + ')')
     return ('tab ' + $t + ' closed')
   }
+  # Process tree per tab for the tabs panel: the bridge (owns the listen port) -> cmd.exe ->
+  # whatever runs there (python/ComfyUI...). Snapshot comes from Toolhelp32 (TrayWin.Win):
+  # Get-CimInstance Win32_Process FAILS inside the tray's worker runspace with "Access denied"
+  # (probe-verified 2026-10-15: same query works from SSH and from cmd children, but the
+  # runspace of a scheduled-task tray is denied) — so WMI must not be used here at all.
+  $procsPoll = 0
   $wdPoll = 0   # counter for periodic 'wd' fetches (tooltip/menu folder stays honest)
   # optional manual seam: write a line "!file <cmd>" into tray_cmd.txt (same folder) to enqueue
   # a menu command from outside the UI — same handlers, same queue. ("!detect", "!setep h p", ...)
@@ -237,7 +336,10 @@ $workerBody = {
       $h = New-TabState $t '' $workDirDefault
       $h['state'] = 'alive'
       $tr = Invoke-BridgeAt $ep0[0] $h['port'] '{"op":"tab"}' 900
-      if ($null -ne $tr -and $tr.Count -ge 1 -and $tr[0] -match '^T\d+ port=\d+ label=(.*)$') { $h['label'] = $matches[1].Trim() }
+      if ($null -ne $tr -and $tr.Count -ge 1 -and $tr[0] -match '^T\d+ port=\d+ label=(.*?)(?: pid=(\d+))?$') {
+        $h['label'] = $matches[1].Trim()
+        if ($matches[2]) { $h['bpid'] = [int] $matches[2] }   # adopted bridge: pid from the bridge itself
+      }
       $wr = Invoke-BridgeAt $ep0[0] $h['port'] '{"op":"wd"}' 900
       if ($null -ne $wr -and $wr.Count -ge 1 -and $wr[0]) { $h['workdir'] = $wr[0].Trim() }
       $p = $probe[0] -split ' '
@@ -326,6 +428,9 @@ $workerBody = {
         $msg = Close-Tab ([int] $matches[1]) 'user request'
         $status['balloon'] = @('info', 'HERMES: tab closed', $msg)
         $immediate = $true
+      } elseif ($j -eq '!panel') {
+        # open/focus the tabs panel (the UI thread does the actual window work)
+        $status['panelopen'] = $true
       } elseif ($j -match '^!tabop (\S+) (\d+)$') {
         # per-tab show/hide from the menu
         $th = $tabs[[int] $matches[2]]
@@ -523,6 +628,50 @@ $workerBody = {
       if ($h['state'] -eq 'alive') { $anyAlive = $true; $opsSum += [int] $h['ops']; if ($h['visible']) { $anyVisible = $true } }
       elseif ($h['state'] -eq 'busy') { $anyBusy = $true }
     }
+    # ---- process trees for the tabs panel (every ~3rd cycle; ONE Toolhelp snapshot for all) ----
+    $procsPoll++
+    if ($procsPoll -ge 3 -and $tabs.Count -ge 1) {
+      $procsPoll = 0
+      try {
+        $all = [TrayWin.Win]::Snapshot()
+        $byParent = @{}
+        foreach ($p in $all) {
+          $pp = [int] $p.ppid
+          if (-not $byParent.ContainsKey($pp)) { $byParent[$pp] = New-Object 'System.Collections.Generic.List[object]' }
+          $byParent[$pp].Add($p)
+        }
+        $pidSet = @{}
+        foreach ($p in $all) { $pidSet[[int] $p.pid] = $p }
+        foreach ($t in @($tabs.Keys)) {
+          $h = $tabs[$t]
+          $rows = @()
+          $bp = 0
+          # bridge pid: from our own launch, else adopted via the bridge's own 'tab' reply.
+          # Get-NetTCPConnection is CIM too and DENIED in this runspace - never use it here.
+          if ($h['proc'] -and -not $h['proc'].HasExited) { $bp = [int] $h['proc'].Id }
+          elseif ($h.ContainsKey('bpid')) { $bp = [int] $h['bpid'] }
+          if ($bp -and $pidSet.ContainsKey($bp)) {
+            $rows += [pscustomobject]@{ name = $pidSet[$bp].name; pid = $bp; cpu = [int] ($pidSet[$bp].cpuMs / 1000); ram = [math]::Round($pidSet[$bp].ramMB, 1); d = 0 }
+            $frontier = New-Object 'System.Collections.Generic.List[object]'
+            $frontier.Add([pscustomobject]@{ p = $bp; d = 0 })
+            while ($frontier.Count -gt 0 -and $rows.Count -lt 14) {
+              $cur = $frontier[0]; $frontier.RemoveAt(0)
+              # PS 5.1 AND 7: $obj['p'] on a pscustomobject returns NULL (only $obj.p works) —
+              # server-verified: the indexer made $byParent[null] throw "argument type mismatch".
+              if ($cur.d -ge 3) { continue }
+              $kids = $byParent[[int] $cur.p]
+              if ($null -eq $kids) { continue }
+              foreach ($c in $kids) {
+                if ($null -eq $c) { continue }
+                $rows += [pscustomobject]@{ name = $c.name; pid = [int] $c.pid; cpu = [int] ($c.cpuMs / 1000); ram = [math]::Round($c.ramMB, 1); d = ($cur.d + 1) }
+                $frontier.Add([pscustomobject]@{ p = [int] $c.pid; d = ($cur.d + 1) })
+              }
+            }
+          }
+          $h['procs'] = $rows
+        }
+      } catch { WLog ('procs poll failed: ' + $_.Exception.Message) }
+    }
     $status['state'] = if ($anyAlive) { 'alive' } elseif ($anyBusy) { 'busy' } else { 'down' }
     $status['ops'] = $opsSum
     $status['visible'] = $anyVisible
@@ -602,6 +751,7 @@ $miTabs = New-Object System.Windows.Forms.ToolStripMenuItem
 $miTabs.Text = 'Tabs'
 [void] $menu.Items.Add($miTabs)
 $miAddTab = $menu.Items.Add('New tab...')
+$miPanel = $menu.Items.Add('Tabs panel (browser-style)')
 [void] $menu.Items.Add('-')
 $miRestart = $menu.Items.Add('Restart all bridges')
 # ---- Endpoint section: where this tray talks to the bridge (host:port) ----
@@ -751,6 +901,217 @@ function Show-NewTabDialog {
   return ($lbl + '|' + $wd)
 }
 
+# ================================ TABS PANEL (browser-style) ================================
+# A small window owned by the tray: a Chrome-like tab strip on top and the process tree of the
+# selected tab under it. Same UI rule as the menu: reads ONLY the worker's status cache and
+# ENQUEUES commands — no sockets, no Sleep on the UI thread.
+#   click a tab      = select it + bring its console to the front (shows it first if hidden)
+#   double-click     = show/hide that console (same as the tray icon double-click, per tab)
+#   x on a tab       = close the tab        + at the end = New tab dialog
+$script:panel = $null
+$script:panelSel = 0
+$script:panelRects = @()      # each: @(x0, x1, tabId) - hit-testing for clicks
+$script:panelPlus = $null     # @(x0, x1) of the + button
+$script:panelFocusPending = 0 # tab id to foreground once its window became visible
+$script:panelTick = 0
+
+function Get-PanelTabData([int] $id) {
+  foreach ($t in @($script:status['tablist'])) { if ([int] $t.tab -eq $id) { return $t } }
+  return $null
+}
+function Update-Panel {
+  if (-not $script:panel -or $script:panel.IsDisposed) { return }
+  $tl = @($script:status['tablist'])
+  $have = $false
+  foreach ($t in $tl) { if ([int] $t.tab -eq [int] $script:panelSel) { $have = $true } }
+  if (-not $have) { $script:panelSel = $(if ($tl.Count) { [int] $tl[0].tab } else { 0 }) }
+  $lv = $script:panel.Controls['lv']
+  $cap = $script:panel.Controls['cap']
+  $sel = Get-PanelTabData ([int] $script:panelSel)
+  if ($sel) {
+    $nm = 'T' + [int] $sel.tab
+    if ($sel.label) { $nm += ' - ' + [string] $sel.label }
+    $cap.Text = $nm + '    |    ' + [string] $sel.workdir + '    |    port ' + [int] $sel.port +
+                '    |    ' + $(if ($sel.visible) { 'VISIBLE' } elseif ($sel.state -eq 'alive') { 'hidden' } elseif ($sel.state -eq 'busy') { 'busy (working)' } else { 'DOWN' })
+    $lv.BeginUpdate(); $lv.Items.Clear()
+    foreach ($p in @($sel.procs)) {
+      $ind = ('   ' * [int] $p.d) + $(if ([int] $p.d -gt 0) { '+- ' } else { '' })
+      $it = New-Object System.Windows.Forms.ListViewItem(($ind + [string] $p.name))
+      [void] $it.SubItems.Add([string] [int] $p.pid)
+      [void] $it.SubItems.Add([string] [int] $p.cpu)
+      [void] $it.SubItems.Add([string] ([double] $p.ram))
+      [void] $lv.Items.Add($it)
+    }
+    if (@($sel.procs).Count -eq 0) {
+      $it = New-Object System.Windows.Forms.ListViewItem('(no live process - bridge down or not started yet)')
+      [void] $lv.Items.Add($it)
+    }
+    $lv.EndUpdate()
+  } else { $cap.Text = '(no tabs)'; $lv.Items.Clear() }
+  $script:panel.Invalidate()   # repaint the strip (dots/selection)
+}
+
+function Show-TabsPanel {
+  try { WLog 'ui: tabs panel open requested' } catch {}
+  if ($script:panel -and -not $script:panel.IsDisposed) {
+    $script:panel.Show()
+    if ($script:panel.WindowState -eq [System.Windows.Forms.FormWindowState]::Minimized) { $script:panel.WindowState = 'Normal' }
+    [void] [TrayWin.Win]::SetForegroundWindow($script:panel.Handle)
+    Update-Panel
+    return
+  }
+  $f = New-Object System.Windows.Forms.Form
+  $f.Name = 'tabspanel'
+  $f.Text = 'HERMES-CONSOLE - tabs'
+  $f.FormBorderStyle = 'Sizable'
+  $f.MaximizeBox = $true; $f.MinimizeBox = $true
+  $f.ShowInTaskbar = $true
+  $f.StartPosition = 'Manual'; $f.Location = New-Object System.Drawing.Point(90, 90)
+  $f.ClientSize = New-Object System.Drawing.Size(860, 430)
+  $f.MinimumSize = New-Object System.Drawing.Size(560, 260)
+  $f.BackColor = [System.Drawing.Color]::White
+  $cap = New-Object System.Windows.Forms.Label
+  $cap.Name = 'cap'; $cap.AutoSize = $false
+  $cap.Location = New-Object System.Drawing.Point(10, 40); $cap.Size = New-Object System.Drawing.Size(840, 18)
+  $cap.ForeColor = [System.Drawing.Color]::FromArgb(95, 99, 104)
+  $lv = New-Object System.Windows.Forms.ListView
+  $lv.Name = 'lv'; $lv.View = 'Details'; $lv.FullRowSelect = $true; $lv.GridLines = $true
+  $lv.HideSelection = $false
+  $lv.Location = New-Object System.Drawing.Point(8, 62); $lv.Size = New-Object System.Drawing.Size(844, 360)
+  $lv.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Bottom -bor
+               [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+  [void] $lv.Columns.Add('Process', 400)
+  [void] $lv.Columns.Add('PID', 70)
+  [void] $lv.Columns.Add('CPU s', 70)
+  [void] $lv.Columns.Add('RAM MB', 90)
+  $f.Controls.AddRange(@($cap, $lv))
+
+  # ---- the strip: drawn by hand, Chrome-like (rounded tabs, active white, status dot, x, +) ----
+  # try/catch + stack log: a throw inside a WinForms Paint handler is UNHANDLED at the app domain
+  # level -> the .NET "unhandled exception" dialog on the monitor and the tray dies. Never here.
+    # PS 5.1 PROBE-VERIFIED (evttest.ps1 in session 1): inside a scriptblock handler defined in a
+  # function, the automatic $e is NULL and $this is unreliable (null once wrapped in try/catch).
+  # Event args arrive ONLY as $args[0]=sender, $args[1]=eventargs — capture them to locals BEFORE
+  # the try (a catch block re-binds $args to exception args).
+  $f.Add_Paint({
+    $sender = $args[0]; $pea = $args[1]
+    try {
+    $g = $pea.Graphics
+    $tl = @($script:status['tablist'])
+    $font = $sender.Font
+    $x = 8; $y = 6; $h = 30
+    $script:panelRects = @()
+    $bgc   = [System.Drawing.Color]::FromArgb(222, 225, 230)   # toolbar gray
+    $inact = [System.Drawing.Color]::FromArgb(206, 211, 216)
+    $brdc  = [System.Drawing.Color]::FromArgb(150, 155, 160)
+    $txtc  = [System.Drawing.Color]::FromArgb(60, 64, 67)
+    $sb = New-Object System.Drawing.SolidBrush $bgc
+    $g.FillRectangle($sb, 0, 0, $sender.ClientSize.Width, 40)
+    $sb.Dispose()
+    foreach ($t in $tl) {
+      $nm = 'T' + [int] $t.tab
+      if ($t.label) { $nm += '  ' + [string] $t.label }
+      if ($nm.Length -gt 20) { $nm = $nm.Substring(0, 17) + '...' }
+      $tw = [System.Windows.Forms.TextRenderer]::MeasureText($nm, $font).Width
+      $w = [Math]::Min(210, [Math]::Max(96, ($tw + 52)))
+      $isSel = ([int] $t.tab -eq [int] $script:panelSel)
+      $fill = if ($isSel) { [System.Drawing.Color]::White } else { $inact }
+      $fb = New-Object System.Drawing.SolidBrush $fill
+      $gp = New-Object System.Drawing.Drawing2D.GraphicsPath
+      $r2 = 8
+      $gp.AddArc($x, $y, $r2, $r2, 180, 90)
+      $gp.AddArc(($x + $w - $r2), $y, $r2, $r2, 270, 90)
+      [void] $gp.AddLine(($x + $w), ($y + $h), $x, ($y + $h))
+      $gp.CloseFigure()
+      $g.FillPath($fb, $gp)
+      if ($isSel) { $pen = New-Object System.Drawing.Pen $brdc; $g.DrawPath($pen, $gp); $pen.Dispose() }
+      $fb.Dispose(); $gp.Dispose()
+      # status dot: green alive | yellow busy | red down
+      $dotc = [System.Drawing.Color]::Gray
+      if ($t.state -eq 'alive') { $dotc = [System.Drawing.Color]::FromArgb(52, 168, 83) }
+      elseif ($t.state -eq 'busy') { $dotc = [System.Drawing.Color]::FromArgb(234, 134, 15) }
+      elseif ($t.state -eq 'down') { $dotc = [System.Drawing.Color]::FromArgb(210, 60, 60) }
+      $db = New-Object System.Drawing.SolidBrush $dotc
+      $g.FillEllipse($db, ($x + 10), ($y + 12), 7, 7); $db.Dispose()
+      [System.Windows.Forms.TextRenderer]::DrawText($g, $nm, $font,
+        (New-Object System.Drawing.Rectangle(($x + 22), $y, ($w - 42), $h)), $txtc, [System.Drawing.ContentAlignment]::MiddleLeft)
+      [System.Windows.Forms.TextRenderer]::DrawText($g, ([string] [char] 0x00D7), $font,
+        (New-Object System.Drawing.Rectangle(($x + $w - 20), $y, 16, $h)), $txtc, [System.Drawing.ContentAlignment]::MiddleCenter)
+      $script:panelRects += , @($x, ($x + $w), [int] $t.tab)
+      $x += $w + 4
+    }
+    $px = $x + 6
+    $pen2 = New-Object System.Drawing.Pen $brdc, 1.5
+    $g.DrawEllipse($pen2, $px, ($y + 4), 22, 22)
+    $g.DrawLine($pen2, ($px + 6), ($y + 15), ($px + 16), ($y + 15))
+    $g.DrawLine($pen2, ($px + 11), ($y + 10), ($px + 11), ($y + 20))
+    $pen2.Dispose()
+    $script:panelPlus = @($px, ($px + 22))
+    } catch {
+      WLog ('panel paint error: ' + $_.Exception.Message + ' | at: ' + $_.InvocationInfo.PositionMessage)
+    }
+  })
+
+  $f.Add_MouseClick({
+    $sender = $args[0]; $mea = $args[1]
+    try {
+    $x = [int] $mea.X; $y = [int] $mea.Y
+    if ($y -lt 6 -or $y -gt 36) { return }
+    if ($script:panelPlus -and $x -ge $script:panelPlus[0] -and $x -le $script:panelPlus[1]) {
+      $spec = Show-NewTabDialog
+      if ($null -ne $spec) { $script:cmds.Enqueue(('!addtab ' + $spec)) }
+      return
+    }
+    foreach ($r in $script:panelRects) {
+      if ($x -ge $r[0] -and $x -le $r[1]) {
+        if ($x -ge ($r[1] - 18)) { $script:cmds.Enqueue(('!closetab ' + $r[2])); return }   # the x
+        $script:panelSel = $r[2]
+        Update-Panel
+        $td = Get-PanelTabData $r[2]
+        if ($td -and ($td.state -eq 'alive' -or $td.state -eq 'busy')) {
+          if ($td.visible) {
+            $hw = [TrayWin.Win]::FindConsoleHwnd(('[T' + $r[2] + ']'))
+            if ($hw -ne [IntPtr]::Zero) { [void] [TrayWin.Win]::SetForegroundWindow($hw) }
+          } else {
+            # hidden: ask the worker to show it, foreground it once the show landed (timer)
+            $script:cmds.Enqueue(('!tabop show ' + $r[2]))
+            $script:panelFocusPending = $r[2]
+          }
+        }
+        return
+      }
+    }
+    } catch { WLog ('panel click error: ' + $_.Exception.Message) }
+  })
+  $f.Add_MouseDoubleClick({
+    $sender = $args[0]; $mea = $args[1]
+    try {
+    $x = [int] $mea.X; $y = [int] $mea.Y
+    if ($y -lt 6 -or $y -gt 36) { return }
+    foreach ($r in $script:panelRects) {
+      if ($x -ge $r[0] -and $x -le ($r[1] - 18)) {
+        $td = Get-PanelTabData $r[2]
+        if ($td) {
+          $op = if ($td.visible) { 'hide' } else { 'show' }
+          $script:cmds.Enqueue(('!tabop ' + $op + ' ' + $r[2]))
+          if ($op -eq 'show') { $script:panelFocusPending = $r[2] }
+        }
+        return
+      }
+    }
+    } catch { WLog ('panel dblclick error: ' + $_.Exception.Message) }
+  })
+  # X on the window = hide, not destroy: the panel survives so the strip state stays cheap
+  $f.Add_FormClosing({
+    $sender = $args[0]; $fce = $args[1]
+    if ($fce.CloseReason -eq [System.Windows.Forms.CloseReason]::UserClosing) { $script:panel.Hide(); $fce.Cancel = $true }
+  })
+$f.Add_Shown({ Update-Panel })
+  $script:panel = $f
+  $f.Show()
+  Update-Panel
+}
+
 # Every handler only ENQUEUES — no sockets, no Sleep, so the menu closes instantly and the
 # worker performs the action right after its current poll.
 $miShow.Add_Click({ $script:cmds.Enqueue('!showall') })
@@ -760,6 +1121,7 @@ $miAddTab.Add_Click({
   $spec = Show-NewTabDialog
   if ($null -ne $spec) { $script:cmds.Enqueue(('!addtab ' + $spec)) }
 })
+$miPanel.Add_Click({ Show-TabsPanel })
 $miEpAuto.Add_Click({ $script:cmds.Enqueue('!detect') })
 $miEpManual.Add_Click({
   $spec = Show-EndpointDialog
@@ -800,8 +1162,22 @@ $script:lastOps = -1
 $script:lastEp = ''
 $timer.Add_Tick({
   $script:status['uiBeat'] = Get-Date
+  # tabs panel: keep it live (tab strip dots, process tree) and complete a focus-after-show:
+  # when the worker's show for the clicked tab lands (visible flips), bring its console up.
+  if ($script:panel -and -not $script:panel.IsDisposed -and $script:panel.Visible) {
+    $script:panelTick++
+    if ($script:panelTick -ge 2) { $script:panelTick = 0; Update-Panel }
+    if ($script:panelFocusPending -gt 0) {
+      $td = Get-PanelTabData ([int] $script:panelFocusPending)
+      if ($td -and $td.visible) {
+        $hw = [TrayWin.Win]::FindConsoleHwnd(('[T' + [int] $script:panelFocusPending + ']'))
+        if ($hw -ne [IntPtr]::Zero) { [void] [TrayWin.Win]::SetForegroundWindow($hw); $script:panelFocusPending = 0 }
+      }
+    }
+  }
   if ($script:status['quitui']) {
     # quit came through the worker (menu Quit already exits directly; the tray_cmd.txt seam does not)
+    if ($script:panel -and -not $script:panel.IsDisposed) { $script:panel.Close() }
     $script:ni.Visible = $false
     $script:ni.Dispose()
     $script:ctx.ExitThread()
@@ -812,6 +1188,7 @@ $timer.Add_Tick({
   # try/catch: a WinForms failure here must never kill the message loop (icon would freeze).
   $dummy = $null
   try {
+    if ($script:status.TryRemove('panelopen', [ref] $dummy)) { Show-TabsPanel }
     if ($script:status.TryRemove('pick', [ref] $dummy)) {
       $sel = Show-PickDialog $dummy ([string] $script:status['endpoint'])
       if ($sel) { $script:cmds.Enqueue(('!pick ' + $sel.addr + ' ' + $sel.port)) }
